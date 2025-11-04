@@ -1,0 +1,1125 @@
+# SPDX-License-Identifier: MIT
+# pyright: reportPrivateImportUsage=false, reportAttributeAccessIssue=false
+# pyright: reportUndefinedVariable=false
+"""
+transforms.py
+-------------
+Unified registration and resampling utilities for Neurofluid–MREG.
+
+This module provides small, deterministic helpers to estimate affine/nonlinear
+transforms among native modalities (TOF/MRV/HT2w), T1, and MNI, and to apply
+those transforms for image/label resampling. It also includes a lightweight
+bookkeeping class (`TransformBook`) and a minimal wrapper to denoise MP2RAGE.
+
+Pipeline steps
+--------------
+1. Affine registration: SOURCE → T1 (DIPY, MI; translation → rigid → affine).
+2. Nonlinear registration: T1 → MNI (DIPY SyN, CC; optional).
+3. Resampling helpers: apply affine to a reference grid; compose affine+warp.
+4. Bookkeeping: save/read transform files; chain/invert; label-safe warps.
+
+Inputs / Outputs
+----------------
+Inputs  : NIfTI volumes in native spaces (TOF/MRV/HT2w), T1, MREG mean; optional MNI.
+Outputs : Transform text files (.txt, 4×4), warp fields (NIfTI, vector fields),
+          and resampled image/label NIfTI as requested by callers.
+
+Files written
+-------------
+- derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-<TAG>toT1.txt
+- derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-T1toMNI_warp.nii.gz
+- derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-MNItoT1_warp.nii.gz
+- derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-T1toMREG.txt
+- derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-MREGMEANtoMNI.txt
+- Additional resampled artifacts per caller (e.g., masks/radii) using
+  `sub-<ID>_space-<SPACE>_class-<CLASS>_desc-<DESC>_<SUFFIX>.nii.gz`.
+
+Assumptions / Preconditions
+---------------------------
+- Spaces: inputs are in their native spaces (TOF/MRV/HT2w/MREG) or T1; MNI is
+  resolved to MNI152 1 mm when needed. Affines define geometry consistently.
+- Shapes/dtypes: images are float32/float64 on load; outputs are float32 unless
+  a label is requested (nearest resampling downstream).
+- BIDS naming: filenames follow `sub-<ID>_space-<SPACE>_class-<CLASS>_desc-<DESC>_<SUFFIX>.nii.gz`
+  for NIfTI artifacts; transforms are saved as `_xfm-*.txt` / `_warp.nii.gz`.
+
+Warnings
+--------
+- If a requested MNI template is unavailable, nonlinear registration is skipped
+  gracefully and only affine outputs are produced.
+- Resampling outside FOV returns zeros; labels are resampled with nearest-neighbor.
+
+Public API
+----------
+- register_t1_to_ht2w
+- register_to_t1
+- register_t1_to_mni
+- apply_affine_to_ref
+- apply_affine_then_warp_to_mni
+- TransformBook
+- warp_radii_to_mreg
+- run_mp2rage_denoise
+"""
+import os
+from __future__ import annotations
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+import numpy as np
+import nibabel as nib
+from nibabel.processing import resample_from_to
+
+# DIPY imports for affine + nonlinear registration
+from dipy.align.imaffine import (
+    AffineRegistration,
+    MutualInformationMetric,
+    AffineMap,
+    transform_centers_of_mass)
+from dipy.align.transforms import (
+    TranslationTransform3D,
+    RigidTransform3D,
+    AffineTransform3D)
+from dipy.align.imwarp import SymmetricDiffeomorphicRegistration
+from dipy.align.metrics import CCMetric
+# Local application imports
+from neurofluid_mreg.mp2rage_denoise import mp2rage_denoise
+from .io import SubjectPaths, deriv_name
+
+# -------------------------------------------------------------
+# Utilities (logging, checks)
+# -------------------------------------------------------------
+def _ensure_dir(p: Path) -> None:
+    """Create directory `p` and parents if missing (idempotent)."""
+    p.mkdir(parents=True, exist_ok=True)
+
+def _save_affine_txt(affine: np.ndarray, out_txt: Path) -> Path:
+    """
+    Save a 4×4 affine matrix to a plain-text file.
+
+    Parameters
+    ----------
+    affine : ndarray, shape (4, 4), dtype=float64
+        Affine matrix (will be saved with high precision).
+    out_txt : pathlib.Path
+        Output text path. Parent folders are created if missing.
+
+    Returns
+    -------
+    pathlib.Path
+        The `out_txt` path (for chaining).
+    """
+    out_txt = Path(out_txt)
+    _ensure_dir(out_txt.parent)
+    np.savetxt(out_txt, affine, fmt="%.8f")
+    print(f"[xfm] Saved → {out_txt}")
+    return out_txt
+
+def _load_affine_txt(txt_path) -> np.ndarray:
+    """
+    Load a 4×4 affine matrix from a plain-text file.
+
+    Parameters
+    ----------
+    txt_path : str or pathlib.Path
+        Path to text file created by `_save_affine_txt`.
+
+    Returns
+    -------
+    ndarray, shape (4, 4), dtype=float64
+        Loaded affine matrix.
+    """
+    return np.loadtxt(str(txt_path))
+
+def _resolve_mni_path() -> Path:
+    """
+    Resolve a canonical MNI152 1 mm template path.
+
+    Returns
+    -------
+    pathlib.Path
+        Cached path under `~/.cache/neurofluid_mreg/MNI152_T1_1mm.nii.gz`.
+
+    Notes
+    -----
+    Uses `nilearn.datasets.load_mni152_template` and writes a local cached copy.
+    """
+    from nilearn.datasets import load_mni152_template
+    out = Path(os.path.expanduser("~")) / ".cache" / "neurofluid_mreg" / "MNI152_T1_1mm.nii.gz"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if not out.exists():
+        img = load_mni152_template(resolution=1)  # returns Nifti1Image
+        nib.save(img, str(out))
+        print(f"[xfm] Cached MNI template → {out}")
+    return out
+
+
+# -------------------------------------------------------------
+# Core registration functions
+# -------------------------------------------------------------
+def register_t1_to_ht2w(
+    moving: np.ndarray, moving_aff: np.ndarray,
+    static: np.ndarray, static_aff: np.ndarray,
+    *,
+    reg_mode: str = "rigid_affine",
+    use_nonlin: bool = False,
+    mi_bins: int = 32,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Register T1 (moving) to heavy-T2w (static) image using mutual-information
+    affine registration, with optional SyN nonlinear refinement.
+
+    Parameters
+    ----------
+    moving : ndarray, shape (X, Y, Z), dtype=float32 or float64
+        T1-weighted (UNI or denoised) volume to be aligned.
+    moving_aff : ndarray, shape (4, 4)
+        Affine of the moving image.
+    static : ndarray, shape (X, Y, Z), dtype=float32 or float64
+        Heavy-T2w target image defining the output grid.
+    static_aff : ndarray, shape (4, 4)
+        Affine of the static image.
+    reg_mode : {"rigid", "rigid_affine"}, optional
+        Registration mode. If `"rigid_affine"`, runs translation→rigid→affine
+        stages; otherwise stops after the rigid transform.
+    use_nonlin : bool, optional
+        If True, perform an additional SyN (symmetric diffeomorphic)
+        refinement using cross-correlation metric after affine alignment.
+    mi_bins : int, optional
+        Number of histogram bins for mutual information metric.
+
+    Returns
+    -------
+    moved : ndarray, shape identical to `static`, dtype=float32
+        Moving (T1) volume resampled to the static grid.
+    affine_used : ndarray, shape (4, 4)
+        Final affine matrix used before optional SyN refinement.
+
+    Files written
+    -------------
+    - None (returns arrays only; caller may save to
+      `sub-<ID>_space-HT2W_class-T1_desc-registered_map.nii.gz`).
+
+    Assumptions / Preconditions
+    ---------------------------
+    - Input images are bias-corrected, brain-masked, and roughly aligned.
+    - Operates entirely in image space using DIPY transforms.
+    - Output shape must exactly match `static`; raises if mismatch.
+
+    Warnings
+    --------
+    - If `use_nonlin=True`, nonlinear stage may slightly smooth intensity edges.
+    - Output intensities are clipped to [0, 1] and NaNs/inf replaced with 0/1.
+
+    Raises
+    ------
+    RuntimeError
+        If final resampled volume shape differs from `static`.
+
+    Notes
+    -----
+    - Uses DIPY’s mutual-information metric with three-level pyramid.
+    - Typical runtime: 1–3 min (depends on image size and `use_nonlin` flag).
+    """
+
+    com = transform_centers_of_mass(static, static_aff, moving, moving_aff)
+
+    metric = MutualInformationMetric(nbins=mi_bins, sampling_proportion=0.3)
+    level_iters = [1000, 100, 10]  # tuned elsewhere; logic unchanged
+    sigmas = [3.0, 1.0, 0.0]
+    factors = [4, 2, 1]
+    affreg = AffineRegistration(
+        metric=metric,
+        level_iters=level_iters,
+        sigmas=sigmas,
+        factors=factors,
+    )
+    print(f"[xfm] Affine pyramid (T1→hT2w): iters={level_iters}, sigmas={sigmas}, factors={factors}")
+    trans = affreg.optimize(
+        static, moving,
+        TranslationTransform3D(), params0=None,
+        static_grid2world=static_aff, moving_grid2world=moving_aff,
+        starting_affine=com.affine,
+    )
+
+    rigid = affreg.optimize(
+        static, moving,
+        RigidTransform3D(), params0=None,
+        static_grid2world=static_aff, moving_grid2world=moving_aff,
+        starting_affine=trans.affine,
+    )
+
+    best_map = rigid
+    if reg_mode.lower() in {"rigid_affine", "affine"}:
+        best_map = affreg.optimize(
+            static, moving,
+            AffineTransform3D(), params0=None,
+            static_grid2world=static_aff, moving_grid2world=moving_aff,
+            starting_affine=rigid.affine,
+        )
+
+    moved = best_map.transform(moving).astype(np.float32)
+
+    if use_nonlin:
+        syn_metric = CCMetric(3)
+        sdr = SymmetricDiffeomorphicRegistration(syn_metric, [10, 10, 5])
+        print("[xfm] SyN pyramid (T1→hT2w): iters=[10, 10, 5]")
+        mapping = sdr.optimize(
+            static, moving,
+            static_affine=static_aff, moving_affine=moving_aff,
+            starting_affine=best_map.affine,
+        )
+        moved = mapping.transform(moving).astype(np.float32)
+        affine_used = best_map.affine  # record the affine stage used pre-SyN
+    else:
+        affine_used = best_map.affine
+
+    moved = np.nan_to_num(moved, nan=0.0, posinf=1.0, neginf=0.0)
+    moved = np.clip(moved, 0.0, 1.0).astype(np.float32)
+
+    if moved.shape != static.shape:
+        raise RuntimeError(f"DIPY resample mismatch: {moved.shape} vs {static.shape}")
+
+    return moved, affine_used
+
+def register_to_t1(
+    src_img_path: Path,
+    ref_t1_path: Path,
+    out_dir: Path,
+    *,
+    sub_id: str,
+    modality_tag: str,
+    allow_4d_mean: bool = True,
+) -> Path:
+    """
+    Register a source image to T1 with MI-based affine (translation→rigid→affine).
+
+    Parameters
+    ----------
+    src_img_path : pathlib.Path
+        Moving image (TOF/MRV/HT2w/MREG). If 4D and `allow_4d_mean=True`,
+        the temporal mean is used.
+    ref_t1_path : pathlib.Path
+        Fixed T1 image (denoised MP2RAGE recommended).
+    out_dir : pathlib.Path
+        Output directory for transforms (anat derivatives).
+    sub_id : str
+        Subject identifier including `sub-` prefix.
+    modality_tag : str
+        Token for filename tag (e.g., "TOF", "MRV", "HT2w", "MREG").
+    allow_4d_mean : bool, default=True
+        If True and `src_img_path` is 4D, average over time before registration.
+
+    Returns
+    -------
+    pathlib.Path
+        Path to `sub-<ID>_xfm-<TAG>toT1.txt` (4×4 affine).
+
+    Files written
+    -------------
+    - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-<TAG>toT1.txt
+
+    Assumptions / Preconditions
+    ---------------------------
+    - Inputs are 3D (or 4D averaged) and share valid NIfTI affines.
+    - Uses DIPY with 32-bin mutual information.
+
+    Raises
+    ------
+    ValueError
+        If a 4D source is provided and `allow_4d_mean=False`.
+    """
+    out_dir = Path(out_dir)
+    _ensure_dir(out_dir)
+
+    # Load images
+    moving_img = nib.load(str(src_img_path))
+    fixed_img = nib.load(str(ref_t1_path))
+    moving = moving_img.get_fdata().astype(np.float32)
+    static = fixed_img.get_fdata().astype(np.float32)
+
+    # Reduce 4D to temporal mean if requested
+    if moving.ndim == 4:
+        if not allow_4d_mean:
+            raise ValueError("4D input provided but allow_4d_mean=False")
+        moving = moving.mean(axis=3).astype(np.float32)
+        modality_tag = "MREGMEAN" if modality_tag.upper().startswith("MREG") else modality_tag
+        print(f"[xfm] {modality_tag}: used 4D temporal mean for registration")
+
+    # Initial COM alignment
+    com = transform_centers_of_mass(static, fixed_img.affine, moving, moving_img.affine)
+
+    # MI metric (good for cross-contrast)
+    mi = MutualInformationMetric(nbins=32, sampling_proportion=None)
+
+    # Multires pyramid
+    level_iters = [1000, 100, 10]  # tuned elsewhere; logic unchanged
+    sigmas = [3.0, 1.0, 0.0]
+    factors = [4, 2, 1]
+
+    areg = AffineRegistration(metric=mi, level_iters=level_iters, sigmas=sigmas, factors=factors)
+    print(f"[xfm] Affine pyramid ({modality_tag}→T1): iters={level_iters}, sigmas={sigmas}, factors={factors}")
+
+    # Stage 1: translation
+    xform = TranslationTransform3D()
+    opt = areg.optimize(
+        static, moving, xform, None,
+        static_grid2world=fixed_img.affine,
+        moving_grid2world=moving_img.affine,
+        starting_affine=com.affine,
+    )
+
+    # Stage 2: rigid
+    xform = RigidTransform3D()
+    opt = areg.optimize(
+        static, moving, xform, None,
+        static_grid2world=fixed_img.affine,
+        moving_grid2world=moving_img.affine,
+        starting_affine=opt.affine,
+    )
+
+    # Stage 3: full affine
+    xform = AffineTransform3D()
+    opt = areg.optimize(
+        static, moving, xform, None,
+        static_grid2world=fixed_img.affine,
+        moving_grid2world=moving_img.affine,
+        starting_affine=opt.affine,
+    )
+
+    # Save 4×4 matrix
+    out_txt = out_dir / f"{sub_id}_xfm-{modality_tag}toT1.txt"
+    _save_affine_txt(opt.affine, out_txt)
+    return out_txt
+
+def register_t1_to_mni(
+    t1_path: Path,
+    mni_path: Optional[Path],
+    out_dir: Path,
+    *,
+    sub_id: str,
+    level_iters: Tuple[int, int, int] = (1000,100,10), 
+) -> Tuple["DiffeomorphicMap", Path, Path]:
+    """
+    Nonlinear SyN (CC metric) registration of T1 to MNI152 1 mm.
+
+    Parameters
+    ----------
+    t1_path : pathlib.Path
+        Moving T1 image (native T1 space).
+    mni_path : pathlib.Path or None
+        MNI reference. If None, a canonical template is resolved.
+    out_dir : pathlib.Path
+        Output directory for warp fields (anat derivatives).
+    sub_id : str
+        Subject identifier including `sub-` prefix.
+    level_iters : tuple of int, default=(1000, 100, 10)
+        Pyramid iterations for SyN.
+
+    Returns
+    -------
+    (mapping, fwd_path, inv_path) : tuple
+        `mapping` is a DIPY `DiffeomorphicMap`; paths point to saved warps.
+
+    Files written
+    -------------
+    - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-T1toMNI_warp.nii.gz
+    - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-MNItoT1_warp.nii.gz
+
+    Assumptions / Preconditions
+    ---------------------------
+    - Inputs are 3D volumes with valid affines. A short rigid MI pre-alignment
+      is performed before SyN.
+
+    Warnings
+    --------
+    - If exporting vector fields fails, a compressed `.npz` with error info is
+      written; returned paths may not exist on disk.
+    """
+    out_dir = Path(out_dir)
+    _ensure_dir(out_dir)
+
+    # Always resolve canonical MNI if not provided/doesn't exist
+    mni_path = _resolve_mni_path()
+
+    t1_img  = nib.load(str(t1_path))
+    mni_img = nib.load(str(mni_path))
+    moving  = t1_img.get_fdata().astype(np.float32)   # T1 (moving)
+    static  = mni_img.get_fdata().astype(np.float32)  # MNI (fixed)
+
+    # --------- improved pre-alignment ----------
+    # 1) translation via centers of mass
+    pre = transform_centers_of_mass(static, mni_img.affine, moving, t1_img.affine).affine
+
+    # 2) short rigid MI optimization (handles rotation/scale better than COM alone)
+    mi = MutualInformationMetric(nbins=32)
+    level_iters = [1000, 100, 10]
+    affreg = AffineRegistration(metric=mi, level_iters=level_iters)
+    print(f"[xfm] Pre-rigid pyramid (T1→MNI): iters={level_iters}")
+    rigid = RigidTransform3D()
+    opt = affreg.optimize(
+        static, moving, rigid, None,
+        static_grid2world=mni_img.affine,
+        moving_grid2world=t1_img.affine,
+        starting_affine=pre,
+    )
+    pre = opt.affine  # feed this into SyN
+
+    # --------- SyN (CC)
+    sdr = SymmetricDiffeomorphicRegistration(CCMetric(3), level_iters=list(level_iters))
+    print(f"[xfm] SyN pyramid (T1→MNI): iters={list(level_iters)}")
+    mapping = sdr.optimize(
+        static=static,
+        moving=moving,
+        static_grid2world=mni_img.affine,
+        moving_grid2world=t1_img.affine,
+        prealign=pre,
+    )
+
+    # Save deformation fields (defined on STATIC/MNI grid)
+    fwd_path = out_dir / f"{sub_id}_xfm-T1toMNI_warp.nii.gz"
+    inv_path = out_dir / f"{sub_id}_xfm-MNItoT1_warp.nii.gz"
+    try:
+        fwd = mapping.get_forward_field().astype(np.float32)   # T1→MNI
+        inv = mapping.get_backward_field().astype(np.float32)  # MNI→T1
+        nib.save(nib.Nifti1Image(fwd, mni_img.affine), str(fwd_path))
+        print(f"[xfm] Saved → {fwd_path}")
+        nib.save(nib.Nifti1Image(inv, mni_img.affine), str(inv_path))
+        print(f"[xfm] Saved → {inv_path}")
+    except Exception as e:
+        np.savez_compressed(out_dir / f"{sub_id}_xfm-T1MNI_mapping_export_error.npz", info=str(e))
+        print(f"[xfm] [WARN] Failed to export warps; wrote error NPZ for {sub_id}")
+
+    return mapping, fwd_path, inv_path
+
+
+# -------------------------------------------------------------
+# Applying transforms (resampling)
+# -------------------------------------------------------------
+def apply_affine_to_ref(
+    image_path: Path,
+    affine,                      # Path | np.ndarray (4x4)
+    ref_img_path: Path,
+    out_path: Path,
+    *,
+    interpolation: str = "linear",  # "linear" for images, "nearest" for labels
+) -> Path:
+    """
+    Apply a 4×4 affine and resample an image onto a reference grid.
+
+    Parameters
+    ----------
+    image_path : pathlib.Path
+        Moving image path (3D or 4D).
+    affine : pathlib.Path or ndarray, shape (4, 4)
+        Affine (moving→reference). If path, text file readable via `np.loadtxt`.
+    ref_img_path : pathlib.Path
+        Reference image (target geometry; 3D grid is used).
+    out_path : pathlib.Path
+        Output NIfTI path.
+    interpolation : {"linear", "nearest"}, default="linear"
+        Interpolation mode; use "nearest" for labels.
+
+    Returns
+    -------
+    pathlib.Path
+        `out_path`.
+
+    Files written
+    -------------
+    - Output NIfTI at `out_path` (space/desc/suffix chosen by caller).
+
+    Assumptions / Preconditions
+    ---------------------------
+    - For 4D inputs, the same affine is applied frame-wise.
+    - Operates in image space defined by affines; no header edits beyond write.
+    """
+
+    # --- load moving & reference images ---
+    img = nib.load(str(image_path))
+    data = img.get_fdata().astype(np.float32, copy=False)
+
+    ref = nib.load(str(ref_img_path))
+    ref_shape_3d = ref.shape[:3]  # ensure 3D grid for codomain
+
+    # --- resolve affine ---
+    if isinstance(affine, (str, Path)):
+        A = _load_affine_txt(Path(affine))     # uses np.loadtxt(str(...))
+    else:
+        A = np.asarray(affine, dtype=np.float32)
+        if A.shape != (4, 4):
+            raise ValueError(f"affine must be 4x4, got {A.shape}")
+
+    # --- build mapper (moving -> reference) ---
+    amap = AffineMap(
+        A,
+        domain_grid_shape=img.shape[:3],
+        domain_grid2world=img.affine,
+        codomain_grid_shape=ref_shape_3d,
+        codomain_grid2world=ref.affine,
+    )
+
+    # --- resample ---
+    if data.ndim == 3:
+        res = amap.transform(data, interpolation=interpolation)
+        nib.save(nib.Nifti1Image(res.astype(np.float32, copy=False), ref.affine), str(out_path))
+        print(f"[xfm] Saved → {out_path}")
+    else:
+        nt = data.shape[3]
+        out = np.empty(ref_shape_3d + (nt,), dtype=np.float32)
+        print(f"[xfm] 4D input detected; applying affine frame-wise (nt={nt})")
+        for t in range(nt):
+            out[..., t] = amap.transform(data[..., t], interpolation=interpolation)
+        nib.save(nib.Nifti1Image(out, ref.affine), str(out_path))
+        print(f"[xfm] Saved → {out_path}")
+    return Path(out_path)
+
+def apply_affine_then_warp_to_mni(
+    image_path: Path,
+    affine_txt: Path,
+    mapping: "DiffeomorphicMap",
+    mni_path: Path,
+    out_path: Path,
+    *,
+
+    is_label: bool = False,
+) -> Path:
+    """
+    Compose (src→T1 affine) with (T1→MNI warp) and resample to MNI.
+
+    Parameters
+    ----------
+    image_path : pathlib.Path
+        Moving image path (3D or 4D).
+    affine_txt : pathlib.Path
+        4×4 affine text file (src→T1).
+    mapping : DiffeomorphicMap
+        T1→MNI map returned by `register_t1_to_mni`.
+    mni_path : pathlib.Path
+        MNI template (target geometry).
+    out_path : pathlib.Path
+        Output NIfTI path.
+    is_label : bool, default=False
+        If True, use nearest-neighbor at both steps.
+
+    Returns
+    -------
+    pathlib.Path
+        `out_path`.
+
+    Files written
+    -------------
+    - Output NIfTI at `out_path` in space-MNI (suffix chosen by caller).
+
+    Assumptions / Preconditions
+    ---------------------------
+    - For 4D, frames are resampled independently.
+    - Operates in image space; geometry pulled to T1 then warped to MNI.
+    """
+    img = nib.load(str(image_path))
+    data = img.get_fdata().astype(np.float32)
+    mni = nib.load(str(mni_path))
+
+    interp_img = "nearest" if is_label else "linear"
+    from dipy.align.imaffine import AffineMap
+
+    A = _load_affine_txt(affine_txt)
+    # First, affine-resample onto T1 grid by pulling data into T1 geometry.
+    # For simplicity, we directly compose by transforming data in world coords.
+    # We resample to MNI in the second step via the mapping.
+
+    if data.ndim == 3:
+        # Affine to T1 space (using T1 geometry implicit in mapping.moving_grid2world)
+        t1_shape = mapping.domain_shape
+        t1_aff   = mapping.domain_grid2world
+        amap = AffineMap( A, domain_grid_shape=img.shape[:3],
+                         domain_grid2world=img.affine, codomain_grid_shape=t1_shape,
+                         codomain_grid2world=t1_aff, )
+        data_t1 = amap.transform(data, interpolation=interp_img)
+        # Nonlinear to MNI
+        data_mni = mapping.transform(data_t1, interpolation=interp_img)
+        nib.save(nib.Nifti1Image(data_mni.astype(np.float32), mni.affine), str(out_path))
+        print(f"[xfm] Saved → {out_path}")
+    else:
+        nt = data.shape[3]
+        out = np.zeros(mni.shape + (nt,), dtype=np.float32)
+        t1_shape = mapping.domain_shape
+        t1_aff   = mapping.domain_grid2world
+        amap = AffineMap( A, domain_grid_shape=img.shape[:3],
+                         domain_grid2world=img.affine, codomain_grid_shape=t1_shape,
+                         codomain_grid2world=t1_aff, )
+        for t in range(nt):
+            frame_t1 = amap.transform(data[..., t], interpolation=interp_img)
+            out[..., t] = mapping.transform(frame_t1, interpolation=interp_img)
+        nib.save(nib.Nifti1Image(out, mni.affine), str(out_path))
+        print(f"[xfm] Saved → {out_path}")
+    return Path(out_path)
+
+
+# -------------------------------------------------------------
+# Transform bookkeeping (compose chains, inversion, etc.)
+# -------------------------------------------------------------
+@dataclass
+class SubjectPaths:
+    """
+    Minimal paths container for registration bookkeeping.
+
+    Attributes
+    ----------
+    sub : str
+        Subject ID including the 'sub-' prefix (e.g., 'sub-xh33_x107').
+    derivatives_root : pathlib.Path
+        Root of derivatives (e.g., Path('derivatives')).
+
+    Notes
+    -----
+    The property `anat_dir` points to:
+    `derivatives/neurofluid-mreg/<SUB>/anat`.
+    """
+    sub: str                 # e.g., "sub-xh33_x107"  (already includes "sub-")
+    derivatives_root: Path   # e.g., Path("derivatives")
+
+    @property
+    def anat_dir(self) -> Path:
+        """Return `derivatives/neurofluid-mreg/<SUB>/anat`."""
+        return Path(self.derivatives_root) / "neurofluid-mreg" / self.sub / "anat"
+
+@dataclass
+class TransformBook:
+    """
+    Bookkeeping for core transform estimation and filenames.
+
+    Parameters
+    ----------
+    sp : SubjectPaths
+        Must expose `sub` and **`transforms_dir`** (or `anat_dir` if aliased)
+        where transform files are saved.
+
+    Attributes
+    ----------
+    paths : dict
+        Saved artifacts keyed by:
+        - 'tof_to_t1'            : 4×4 txt
+        - 'mrv_to_t1'            : 4×4 txt (if MRV provided)
+        - 'ht2w_to_t1'           : 4×4 txt (if HT2w provided)
+        - 'mregmean_to_t1'       : 4×4 txt
+        - 't1_to_mni_warp'       : NIfTI (vector field; if MNI available)
+        - 'mni_to_t1_warp'       : NIfTI (vector field; if MNI available)
+        - 't1_to_mreg'           : 4×4 txt (inverse of mregmean→t1)
+        - 'mregmean_to_mni_chain': txt with 2-line chain descriptor (if warps exist)
+
+    Notes
+    -----
+    Filenames start with the subject ID (`sub-...`) and use `_xfm-<TAG><EXT>`.
+    Affine files are saved as plain text (4×4) with high precision.
+    """
+    sp: SubjectPaths
+    paths: Dict[str, Path] = field(default_factory=dict)
+
+    def _xfm_path(self, tag: str, ext: str) -> Path:
+        """
+        Build an output path under the subject's transforms directory.
+
+        Returns
+        -------
+        pathlib.Path
+            `derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-<tag><ext>`.
+        """
+        return Path(self.sp.transforms_dir) / f"{self.sp.sub}_xfm-{tag}{ext}"
+
+    def estimate_and_save_core_transforms(
+        self,
+        t1_denoised_path: Path,
+        tof_path: Path,
+        mreg_mean_path: Path,
+        *,
+        mrv_path: Optional[Path] = None,
+        ht2w_path: Optional[Path] = None,
+        mni_path: Optional[Path] = None,
+    ) -> None:
+        """
+        Estimate TOF/MRV/HT2w/MREGMEAN → T1 affines; optionally T1 ↔ MNI warps.
+
+        Parameters
+        ----------
+        t1_denoised_path : pathlib.Path
+            Denoised T1 (fixed image).
+        tof_path : pathlib.Path
+            TOF image to register to T1.
+        mreg_mean_path : pathlib.Path
+            Mean MREG (3D) for MREGMEAN→T1.
+        mrv_path : pathlib.Path or None
+            Optional MRV image for MRV→T1.
+        ht2w_path : pathlib.Path or None
+            Optional heavy-T2w image for HT2w→T1.
+        mni_path : pathlib.Path or None
+            Optional MNI path; if None, a template is resolved.
+
+        Files written
+        -------------
+        - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-TOFtoT1.txt
+        - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-MRVtoT1.txt
+        - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-HT2wtoT1.txt
+        - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-MREGMEANtoT1.txt
+        - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-T1toMNI_warp.nii.gz
+        - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-MNItoT1_warp.nii.gz
+        - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-T1toMREG.txt
+        - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-MREGMEANtoMNI.txt
+
+        Assumptions / Preconditions
+        ---------------------------
+        - `sp.transforms_dir` is writable. Affines/warps are saved there.
+        - Nonlinear registration is attempted only if an MNI template is available.
+        """
+        _ensure_dir(Path(self.sp.transforms_dir))  # no behavioral changes
+
+        # ---- src→T1 affines ----
+        self.paths["tof_to_t1"] = register_to_t1(
+            tof_path, t1_denoised_path, Path(self.sp.transforms_dir),
+            sub_id=self.sp.sub, modality_tag="TOF"
+        )
+
+        if mrv_path is not None:
+            self.paths["mrv_to_t1"] = register_to_t1(
+                mrv_path, t1_denoised_path, Path(self.sp.transforms_dir),
+                sub_id=self.sp.sub, modality_tag="MRV"
+            )
+
+        if ht2w_path is not None:
+            self.paths["ht2w_to_t1"] = register_to_t1(
+                ht2w_path, t1_denoised_path, Path(self.sp.transforms_dir),
+                sub_id=self.sp.sub, modality_tag="HT2w"
+            )
+
+        self.paths["mregmean_to_t1"] = register_to_t1(
+            mreg_mean_path, t1_denoised_path, Path(self.sp.transforms_dir),
+            sub_id=self.sp.sub, modality_tag="MREGMEAN"
+        )
+
+        # ---- T1→MNI nonlinear (optional; only if we have a template) ----
+        self._mapping_cache = None
+        self.mni_ref_path = None
+
+        # If caller didn't pass an MNI path, try to resolve one automatically
+        if mni_path is None:
+            try:
+                mni_path = _resolve_mni_path()
+                print(f"[xfm] Using resolved MNI template: {mni_path}")
+            except Exception as e:
+                print(f"[xfm] No MNI template available ({e}); skipping MNI warps.")
+
+        if mni_path is not None and Path(mni_path).exists():
+            mapping, fwd_warp, inv_warp = register_t1_to_mni(
+                t1_denoised_path, mni_path, Path(self.sp.transforms_dir), sub_id=self.sp.sub
+            )
+            self.paths["t1_to_mni_warp"] = fwd_warp
+            self.paths["mni_to_t1_warp"] = inv_warp
+            self._mapping_cache = mapping
+            self.mni_ref_path = Path(mni_path)
+        else:
+            print("[xfm] Skipping MNI: template path missing or not found.")
+
+        # ---- Derived: T1→MREG (inverse of MREGMEAN→T1) ----
+        A = _load_affine_txt(self.paths["mregmean_to_t1"])
+        Ainv = np.linalg.inv(A)
+        t1_to_mreg = self._xfm_path("T1toMREG", ".txt")
+        _save_affine_txt(Ainv, t1_to_mreg)
+        self.paths["t1_to_mreg"] = t1_to_mreg
+
+        # ---- Convenience chain descriptor: MREGMEAN→MNI ----
+        if "t1_to_mni_warp" in self.paths:
+            chain_txt = self._xfm_path("MREGMEANtoMNI", ".txt")
+            with open(chain_txt, "w", encoding="utf-8") as f:
+                f.write(str(self.paths["mregmean_to_t1"]) + "\n")
+                f.write(str(self.paths["t1_to_mni_warp"]) + "\n")
+            self.paths["mregmean_to_mni_chain"] = chain_txt
+
+    def get(self, key: str):
+        """
+        Retrieve a saved transform path by key.
+
+        Parameters
+        ----------
+        key : str
+            Name in `self.paths` (see class docstring for common keys).
+
+        Returns
+        -------
+        pathlib.Path
+            Path to the transform artifact.
+
+        Raises
+        ------
+        KeyError
+            If the key is not present.
+        """
+        try:
+            return self.paths[key]
+        except KeyError:
+            raise KeyError(f"Transform '{key}' not found. Available: {list(self.paths.keys())}")
+
+    def warp_labels(
+        self,
+        *,
+        moving_img: str,
+        reference_img: str,
+        out_path: str,
+        chain: tuple = ("MNI", "T1"),
+        interpolation: str = "nearest",
+    ) -> None:
+        """
+        Label-safe resampling using existing transforms.
+
+        Parameters
+        ----------
+        moving_img : str
+            Path to moving label image (NIfTI).
+        reference_img : str
+            Path to target reference image (NIfTI).
+        out_path : str
+            Output NIfTI path (written).
+        chain : tuple, default=("MNI", "T1")
+            Supported chains:
+              - ("MNI","T1")  : inverse T1↔MNI map → snap to requested T1 grid.
+              - ("T1","MREG") : 4×4 T1→MREG affine.
+        interpolation : {"nearest","linear"}, default="nearest"
+            Resampling order; labels should use "nearest".
+
+        Files written
+        -------------
+        - Output label NIfTI at `out_path` (space chosen by chain target).
+
+        Raises
+        ------
+        RuntimeError
+            If MNI mapping is requested but unavailable.
+        NotImplementedError
+            If the `chain` is unsupported.
+        """
+
+        order = 0 if interpolation == "nearest" else 1
+        mov = nib.load(moving_img)
+        ref = nib.load(reference_img)
+
+        if chain == ("MNI", "T1"):
+            if getattr(self, "_mapping_cache", None) is None:
+                raise RuntimeError("No T1↔MNI mapping cached. Did you skip T1→MNI registration?")
+            mapping = self._mapping_cache  # domain: T1, codomain: MNI
+
+            # If the moving mask grid doesn't match the exact MNI template we used, align it first
+            if getattr(self, "mni_ref_path", None):
+                mni_ref = nib.load(str(self.mni_ref_path))
+                if (mov.shape != mni_ref.shape) or not np.allclose(mov.affine, mni_ref.affine, atol=1e-3):
+                    mov = resample_from_to(mov, (mni_ref.shape, mni_ref.affine), order=0)
+
+            data = np.asanyarray(mov.get_fdata(), dtype=np.float32)
+            # Transform codomain (MNI) → domain (T1)
+            try:
+                out_data = mapping.transform_inverse(data, interpolation="nearest" if order == 0 else "linear")
+            except TypeError:
+                out_data = mapping.transform_inverse(data)
+
+            out_img = nib.Nifti1Image(out_data, mapping.domain_grid2world, ref.header.copy())
+
+            # If this T1 grid (from mapping) differs from the requested T1 reference, resample once more (affine-only)
+            if (out_img.shape != ref.shape) or not np.allclose(out_img.affine, ref.affine, atol=1e-3):
+                out_img = resample_from_to(out_img, (ref.shape, ref.affine), order=order)
+
+            nib.save(out_img, out_path)
+            return
+
+        if chain == ("T1", "MREG"):
+            # Saved 4×4 T1→MREG
+            A_t1_to_mreg = np.loadtxt(self.get("t1_to_mreg"))
+
+            # Embed the T1→MREG affine into the moving image's affine,
+            # so that resample_from_to uses the desired mapping implicitly.
+            mov_data = mov.get_fdata()
+            mov_hdr  = mov.header.copy()
+            mov_prime_affine = A_t1_to_mreg @ mov.affine
+            mov_prime = nib.Nifti1Image(mov_data, mov_prime_affine, mov_hdr)
+
+            # Now a plain resample_to the reference grid is enough (nearest for labels)
+            out_img = resample_from_to(mov_prime, ref, order=order)
+
+            nib.save(out_img, out_path)
+            return
+
+        raise NotImplementedError(f"Unsupported chain {chain}")
+
+
+# -------------------------------------------------------------
+# Radii estimation / fitting / QC (warping only in this module)
+# -------------------------------------------------------------
+def warp_radii_to_mreg(
+    sp: SubjectPaths,
+    xfm,  # TransformBook
+    *,
+    mreg_ref_path: Path,
+    t1_ref_path: Path | None = None,
+    overwrite: bool = False,
+) -> dict[str, Path]:
+    """
+    Warp native-space radius maps (TOF/MRV/HT2W) → MREG via T1.
+
+    Parameters
+    ----------
+    sp : SubjectPaths
+        Subject-scoped paths/naming helper.
+    xfm : TransformBook
+        Provides native→T1 and T1→MREG transforms.
+    mreg_ref_path : pathlib.Path
+        MREG reference image (grid target).
+    t1_ref_path : pathlib.Path or None, default=None
+        T1 reference image; falls back to `sp.anat_t1w` if None.
+    overwrite : bool, default=False
+        If False, skip outputs that already exist.
+
+    Returns
+    -------
+    dict
+        Mapping `{klass: out_path}` for artifacts produced.
+
+    Files written
+    -------------
+    - derivatives/neurofluid-mreg/sub-<ID>/radii/sub-<ID>_space-MREG_class-<CLASS>_desc-radius_map.nii.gz
+
+    Assumptions / Preconditions
+    ---------------------------
+    - Native radii maps must exist under `radii/` per class; nearest resampling
+      is used for label-like radii maps.
+    """
+    out: dict[str, Path] = {}
+
+    # Resolve reference images (3D)
+    mreg_ref_img = nib.load(str(mreg_ref_path))
+    if t1_ref_path is None:
+        # fallback: subject's original T1
+        t1_ref_path = Path(sp.anat_t1w)
+    t1_ref_img = nib.load(str(t1_ref_path))
+
+    # mapping per class
+    mapping = {
+        "arteries": ("TOF",  "tof_to_t1"),
+        "veins":    ("MRV",  "mrv_to_t1"),
+        "pvs":      ("HT2W", "ht2w_to_t1"),
+    }
+
+    def _apply_native_to_t1(native_img: Path, akey: str, out_t1_img: Path) -> Path:
+        # Use existing apply_affine_to_ref with NEAREST (label-like)
+        A = xfm.get(akey)  # path to 4x4 txt
+        return apply_affine_to_ref(
+            image_path=native_img,
+            affine=A,
+            ref_img_path=Path(t1_ref_path),
+            out_path=out_t1_img,
+            interpolation="nearest",
+        )
+
+    def _apply_t1_to_mreg(t1_img: Path, out_mreg_img: Path) -> Path:
+        # Use TransformBook.warp_labels with chain ("T1","MREG")
+        xfm.warp_labels(
+            moving_img=str(t1_img),
+            reference_img=str(mreg_ref_path),
+            out_path=str(out_mreg_img),
+            chain=("T1", "MREG"),
+            interpolation="nearest",
+        )
+        return out_mreg_img
+
+    for klass, (space, key_native_to_t1) in mapping.items():
+        src_native = Path(sp.radii_dir) / deriv_name(sp.sub, space, klass, "radius", "map")
+        if not src_native.exists():
+            # nothing to warp for this class
+            continue
+
+        out_mreg = Path(sp.radii_dir) / deriv_name(sp.sub, "MREG", klass, "radius", "map")
+        if out_mreg.exists() and not overwrite:
+            out[klass] = out_mreg
+            continue
+
+        # temp file in T1 geometry
+        tmp_t1 = Path(sp.radii_dir) / deriv_name(sp.sub, "T1", klass, "radius", "map")
+
+        # Step 1: native → T1
+        try:
+            _apply_native_to_t1(src_native, key_native_to_t1, tmp_t1)
+        except KeyError as e:
+            # Give a helpful error listing available keys
+            available = getattr(xfm, "paths", {}).keys()
+            print(f"[radii-warp] Missing transform key '{key_native_to_t1}'. Available: {list(available)}")
+            continue
+
+        # Step 2: T1 → MREG
+        _apply_t1_to_mreg(tmp_t1, out_mreg)
+        out[klass] = out_mreg
+
+        # optional: clean temp
+        try:
+            tmp_t1.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        # final sanity: ensure exact MREG grid
+        m = nib.load(str(out_mreg))
+        if (m.shape != mreg_ref_img.shape) or (not np.allclose(m.affine, mreg_ref_img.affine, atol=1e-3)):
+            # fallback snap (shouldn't happen if transforms are correct)
+            snapped = resample_from_to(m, (mreg_ref_img.shape, mreg_ref_img.affine), order=0)
+            nib.save(snapped, str(out_mreg))
+
+        print(f"[radii-warp] Saved: {out_mreg.name}")
+
+    if not out:
+        print("[radii-warp] Nothing to warp (no native radii found or all already up-to-date).")
+    return out
+
+
+# -------------------------------------------------------------
+# Preprocessing (denoise, normalize, CLAHE)
+# -------------------------------------------------------------
+def run_mp2rage_denoise(uni_path: Path,
+                        inv1_path: Path,
+                        inv2_path: Path,
+                        out_dir: Path,
+                        sub_id: str,
+                        lamb: float = 10.0,
+                        corner_width: int = 11) -> Path:
+    """
+    Denoise MP2RAGE and save a denoised T1 under anat derivatives.
+
+    Parameters
+    ----------
+    uni_path : pathlib.Path
+        MP2RAGE UNI image.
+    inv1_path : pathlib.Path
+        MP2RAGE INV1 image.
+    inv2_path : pathlib.Path
+        MP2RAGE INV2 image.
+    out_dir : pathlib.Path
+        Output anat derivatives directory.
+    sub_id : str
+        Subject identifier including `sub-` prefix.
+    lamb : float, default=10.0
+        Regularization factor.
+    corner_width : int, default=11
+        Corner cube width for noise estimate.
+
+    Returns
+    -------
+    pathlib.Path
+        Path to `<out_dir>/<sub_id>_T1w_denoised.nii.gz`.
+
+    Files written
+    -------------
+    - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_T1w_denoised.nii.gz
+    """
+    out_path = out_dir / f"{sub_id}_T1w_denoised.nii.gz"
+    if out_path.exists():
+        print(f"[mp2rage] [SKIP] Exists: {out_path.name}")
+        return out_path
+
+    mp2rage_denoise(uni_path, inv1_path, inv2_path,
+                    out_path=out_path,
+                    lamb=lamb,
+                    corner_width=corner_width)
+    print(f"[mp2rage] Saved → {out_path}")  # keep your existing style here
+    return out_path

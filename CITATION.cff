@@ -1,0 +1,57 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it."
+title: "Neurofluid–MREG: BIDS-first vascular segmentation and spectral analysis pipeline"
+abstract: |
+  Open-source, BIDS-first pipeline linking ultra-fast MREG BOLD signals
+  to vascular structures (arteries, veins, PVS) via native-space segmentation,
+  distance/radii mapping, and band-limited spectral analysis.
+authors:
+  - family-names: Tashraf Hussain
+    given-names: Yasin 
+    affiliation: Otto-von-Guericke University Magdeburg (OVGU), Germany
+    email: yasin.tashraf@st.ovgu.de
+license: MIT
+repository-code: "https://github.com/your-username/neurofluid-mreg"   # Update URL as needed
+version: 0.1.0         # Update version if you tag releases
+date-released: 2025-11-03  # Update as appropriate
+keywords:
+  - MRI
+  - MREG
+  - BOLD
+  - Vascular segmentation
+  - Perivascular spaces
+  - Frangi
+  - DIPY
+  - NiBabel
+  - BIDS
+acknowledgments: >
+  I would like to thank Dr. Hendrik Mattern (Department of Biomedical Magnetic Resonance,
+  Institute of Physics, Otto-von-Guericke University Magdeburg) for his valuable guidance,
+  insightful discussions, and for providing reference code snippets and methodological advice
+  that helped shape this work.
+preferred-citation:
+  type: software
+  title: "Neurofluid–MREG"
+  authors:
+    - family-names: Tashraf Hussain
+      given-names: Yasin 
+  year: 2025
+references:
+  - type: article
+    title: "Image processing approaches to enhance perivascular space visibility and quantification using MRI"
+    authors:
+      - family-names: Sepehrband
+        given-names: Farshid
+    year: 2019
+    journal: Scientific Reports
+    doi: 10.1038/s41598-019-48910-x
+    notes: "EPC concept; It didnt worked well in this case."
+  - type: article
+    title: "Assessing Arterial Patterns in the Motor Cortex With 7 Tesla Magnetic Resonance Imaging and Vessel Distance Mapping"
+    authors:
+      - family-names: Mietzner
+        given-names: Georg
+    year: 2025
+    journal: Human Brain Mapping
+    doi: 10.1002/hbm.70311
+    notes: "VDM/radii-related analysis ideas; supervisor-provided script informed approach."
