@@ -54,16 +54,17 @@ bids_root/
 │       ├── sub-<ID>_task-rest_mreg.nii.gz  # Required: 4D MREG fMRI
 │       └── sub-<ID>_task-rest_mreg.json
 ```
-
-**Note**: Convert DICOM to NIfTI using [dcm2niix](https://github.com/rordenlab/dcm2niix). Ensure JSON sidecars are generated, especially for fMRI (contains essential metadata like TR).
+**Note**
+- Convert DICOM to NIfTI using [dcm2niix](https://github.com/rordenlab/dcm2niix). Ensure JSON sidecars are generated, especially for fMRI (contains essential metadata like TR).
+- For more accurate and robust vessel and PVS segmentation, it is recommended to brain mask anatomical images before segmentation. This minimizes false positives from non-brain regions and ensures cleaner results.
+- For more accurate and robust analysis, it is recommended to apply distortion correction on the MREG before frequency analysis.
 
 ### Required vs Optional Data
 
 - **Required**: T1w, TOF (arteries), MREG fMRI
 - **Optional**: MRV (veins), hT2w (PVS), MP2RAGE inversions
 - Pipeline automatically skips steps for missing optional data
-- **Note**: For more accurate and robust vessel and PVS segmentation, it is recommended to brain mask anatomical images before segmentation. This minimizes false positives from non-brain regions and ensures cleaner results.
-- **Note**: For more accurate and robust analysis, it is recommended to apply distortion correction on the MREG before frequency analysis.
+
 
 
 ## Usage
