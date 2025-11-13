@@ -64,7 +64,7 @@ from skimage.filters import frangi, apply_hysteresis_threshold, threshold_multio
 from skimage.morphology import ( white_tophat, black_tophat, ball, disk, 
     remove_small_objects, skeletonize, )
 from scipy import ndimage
-from scipy.ndimage import gaussian_filter, binary_fill_holes , binary_dilation
+from scipy.ndimage import gaussian_filter, binary_fill_holes 
 from skimage.measure import label
 import SimpleITK as sitk
 from .transforms import register_t1_to_ht2w
@@ -1268,6 +1268,20 @@ def segment_pvs_frangi3d(
     # (optional: for debugging/verification)
     _sig_gui = np.arange(smin_v, smax_v + 1e-6, sstep_v)
 
+    def p99_norm(a: np.ndarray, *, positive_only: bool = True) -> np.ndarray:
+        """
+        Normalize to the 99th percentile (robust). Clips to [0,1].
+        If positive_only=True, computes the percentile over a>0 voxels.
+        """
+        a = a.astype(np.float32, copy=False)
+        sample = a[a > 0] if positive_only else a[np.isfinite(a)]
+        if sample.size:
+            p99 = float(np.percentile(sample, 99.0))
+            if p99 > 0:
+                a = a / p99
+        np.clip(a, 0.0, 1.0, out=a)
+        return a
+
     GAMMA_MIN, GAMMA_MAX = 10.0, 25.0
     gamma_fixed = GAMMA_MIN + 0.75 * (GAMMA_MAX - GAMMA_MIN)
 
@@ -1285,7 +1299,6 @@ def segment_pvs_frangi3d(
 
     # after computing vess_iso
     vesselness = p99_norm(np.clip(vess_iso, 0.0, None))
-    vesselness = np.clip(vess_iso, 0.0, 1.0).astype(np.float32)
 
     mask = threshold_vesselness(vess_iso, thresh_frac=float(threshold_value))
     # Skeleton on native grid (3D Lee)

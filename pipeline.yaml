@@ -2,14 +2,15 @@
 # Neurofluid–MREG pipeline.yaml — quick reference
 # =============================================================================
 # Purpose
-#   Configuration for the BIDS-first Neurofluid–MREG pipeline. Paths are explicit;
-#   there is no auto-discovery beyond resolving relative paths under the subject’s
-#   BIDS folders.
+#   Configuration for the BIDS-first Neurofluid–MREG pipeline. Paths are
+#   explicit; there is no auto-discovery beyond resolving relative paths
+#   under the subject’s BIDS folders.
 #
 # Required paths
 #   bids_root : Root folder containing subject folders like sub-<ID>/
 #   subject   : Subject label WITHOUT the "sub-" prefix (e.g., xh33_x107)
-#   deriv_root: Where derivatives will be written (per-subject subfolder is created)
+#   deriv_root: Where derivatives will be written (per-subject subfolder
+#               is created)
 #
 # Input files (explicit)
 #   anat.t1w  : Structural T1w (required)
@@ -27,28 +28,61 @@
 #   - On Windows, forward slashes are fine; or escape backslashes.
 #
 # Analysis parameters
-#   bands         : Map of name -> [low, high] in Hz (used for band power maps)
-#   distance_bins : List of bin edges in mm; may include the sentinel "max"
+#   bands
+#     Map of name -> [low, high] in Hz (used for bandpower maps).
+#     Units: Hz; these bands are applied to MREG BOLD after TR is read from
+#            the MREG JSON sidecar.
+#
+#   distance_bins
+#     List of bin edges that must match the units of the distance maps
+#     written in distance.py. For MNI-based Euclidean distances this is
+#     typically in mm, but this should be verified against distance.py.
+#     May include the sentinel string "max" for the open-ended last bin.
 #
 # Radii options
-#   radii_enabled   : true/false to compute native-space centerline radii
-#   radii_overwrite : true/false to recompute if outputs already exist
-#                     (MUST be a boolean, e.g., `false`, not `bool = False`)
+#   radii_enabled
+#     true/false to compute centerline radii on the analysis grid
+#     (currently called with image_space="MNI", seg_space="MNI").
+#     Units are expected to be in mm, but this should be confirmed in
+#     radii.py to rule out voxel units.
+#
+#   radii_overwrite
+#     true/false to recompute if outputs already exist.
+#     NOTE: MUST be a boolean, e.g. `false`, not `bool = False`.
 #
 # Flags
-#   make_mni : true/false to also export masks to MNI if the template is available
-#   dry_run  : true/false; true validates inputs/layout and prints the plan only
-#   make_t1_bold_4d : optional true/false; if true, writes full MREG 4D in T1 space
+#   make_mni
+#     true/false to also export masks/bandpower maps to MNI if the
+#     template/transform is available.
+#
+#   dry_run
+#     true/false; if true, validates inputs/layout and prints the plan
+#     only, without running heavy steps.
+#
+#   make_t1_bold_4d
+#     optional true/false; if true, writes full MREG 4D in T1 space
+#     (used only if supported by transforms/mreg modules).
 #
 # Notes & gotchas
-#   - TR for spectral analysis is read from the MREG JSON sidecar; you do not set it here.
-#   - MRV multi-echo: the code can auto-discover siblings like *_e1.nii.gz, *_e2.nii.gz
+#   - TR for spectral analysis is read from the MREG JSON sidecar; you do
+#     NOT set it here.
+#   - MRV multi-echo: the code can auto-discover siblings like
+#       *_e1.nii.gz, *_e2.nii.gz
 #     next to the configured MRV path; a single MRV path is sufficient.
-#   - BINS and bands must be numeric; the only allowed string is "max" in distance_bins.
+#   - Bands must be numeric [low, high] in Hz.
+#   - distance_bins must be numeric, except for the sentinel "max".
+#     Ensure the bin edges are expressed in the same units as the
+#     distance maps (expected mm in MNI space; verify in distance.py).
 #   - The pipeline writes derivatives under:
 #       derivatives/neurofluid-mreg/sub-<ID>/
 #     with BIDS-style filenames:
 #       sub-<ID>_space-<SPACE>_class-<CLASS>_desc-<DESC>_<SUFFIX>.nii.gz
+#
+# Unit sanity checks (to verify in code)
+#   - bands            : Hz (frequency ranges used after TR from JSON).
+#   - distance_bins    : intended as mm; 
+#   - radii (if used)  : intended as mm on the MNI grid; 
+#   - TR               : seconds from MREG JSON sidecar; not set here.
 # =============================================================================
 
 # ==== REQUIRED PATHS ====
@@ -70,8 +104,8 @@ anat:
   tof:  "xh33_x107_ToF400_wb_cs6_noFC_20250314090142_22.nii.gz"         # REQUIRED
   inv1: "xh33_x107_hm_fg_mp2_0p7_cs4_6000_20250314090142_11.nii.gz"     # optional
   inv2: "xh33_x107_hm_fg_mp2_0p7_cs4_6000_20250314090142_12.nii.gz"     # optional
-  mrv:  "xh33_x107_dzne_ep3d_uhr_0p5iso_tra_3TE_20250314090142_25_e3.nii.gz"
-  ht2w: "xh33_x107_hT2w_spc_fast_TR3000_20250314090142_16.nii.gz"
+#  mrv:  "xh33_x107_dzne_ep3d_uhr_0p5iso_tra_3TE_20250314090142_25_e3.nii.gz"
+#  ht2w: "xh33_x107_hT2w_spc_fast_TR3000_20250314090142_16.nii.gz"
 
 func:
   mreg: "xh33_x107_hm_ep2d_mreg_3p0_12_200_20250314090142_18.nii.gz"   # REQUIRED
@@ -84,10 +118,9 @@ bands:
   VLF: [0.010, 0.027]
 
 distance_bins: [0, 2, 5, 10, "max"]
-radii_enabled: false
-radii_overwrite: false
+radii_enabled: true
+radii_overwrite: true
 
 # ==== FLAGS ====
-make_mni: true
 #make_t1_bold_4d: false
 dry_run: false

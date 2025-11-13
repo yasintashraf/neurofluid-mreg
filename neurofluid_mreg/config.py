@@ -81,8 +81,6 @@ class PipelineConfig:
     distance_bins : list[Number | str] | None
         Distance bin edges in mm. The last edge may be the string "max", which
         downstream resolves to `np.nanmax(distance_map)` per run.
-    make_mni : bool, default True
-        Whether to additionally produce MNI-space outputs (handled downstream).
     dry_run : bool, default True
         If True, orchestrators may list planned steps without executing them.
     radii_enabled : bool, default False
@@ -110,7 +108,6 @@ class PipelineConfig:
     distance_bins: List[Union[Number, str]] = None
 
     # flags
-    make_mni: bool = True
     dry_run: bool = True
 
     radii_enabled: bool = False

@@ -2,10 +2,10 @@
 """
 mreg.py
 -------
-Single-subject MREG preprocessing and label warping for a BIDS-first pipeline.
-This module keeps your algorithmic choices intact (NiPy Realign4d, voxelwise
-polynomial detrend, DIPY staged affine for mean MREG→T1, linear interpolation
-for images, nearest for labels) and standardizes derivatives layout/I-O.
+Single-subject MREG preprocessing and band-power export for a BIDS-first
+pipeline. This module keeps your algorithmic choices intact (NiPy Realign4d,
+voxelwise polynomial detrend, DIPY staged affine for mean MREG→T1, linear
+interpolation for images) and standardizes derivatives layout/I/O.
 
 Pipeline steps
 --------------
@@ -13,14 +13,14 @@ Pipeline steps
 2. Compute a 3D temporal mean on the MREG grid
 3. Register mean MREG → T1 (COM → translation → rigid → affine; MI metric)
 4. Apply the mean→T1 affine to the full 4D series (linear)
-5. Warp native-space masks (TOF/MRV/HT2w) → MREG (and optionally → MNI)
+5. Export MREG-space band-power maps (and mean amplitude) to MNI space
 
 Inputs / Outputs
 ----------------
 Inputs  : Subject-scoped paths via `SubjectPaths`; optional transforms via
           `TransformBook`.
-Outputs : NIfTIs (float32 for images; uint8 for masks) and small text/JSON/TSV
-          auxiliaries written under `derivatives/neurofluid-mreg/sub-<ID>/`.
+Outputs : NIfTIs (float32 for images) and small text/JSON/TSV auxiliaries
+          written under `derivatives/neurofluid-mreg/sub-<ID>/`.
 
 Files written
 -------------
@@ -28,10 +28,11 @@ Files written
 - mreg/<sub>_space-MREG_class-brain_desc-detrended_bold.nii.gz
 - mreg/<sub>_space-MREG_class-brain_desc-mean_map.nii.gz
 - mreg/<sub>_space-T1_class-brain_desc-registered_bold.nii.gz
+- bandmaps/<sub>_space-MNI_band-<BAND>_desc-power_map.nii.gz
+- bandmaps/<sub>_space-MNI_desc-meanamp_map.nii.gz
 - qc/<sub>_desc-motion_params.tsv
 - qc/<sub>_desc-preproc_params.json
-- masks/<sub>_space-MREG_class-<CLASS>_desc-main_mask.nii.gz
-- masks/<sub>_space-MNI_class-<CLASS>_desc-main_mask.nii.gz (optional)
+
 Where filenames follow:
 `sub-<ID>_space-<SPACE>_class-<CLASS>_desc-<DESC>_<SUFFIX>.nii.gz`
 
@@ -40,7 +41,7 @@ Assumptions / Preconditions
 - Spaces: All operations occur in image space of the chosen reference. Apply
   transforms/resampling only where stated. Affine mismatches are handled by
   explicit resampling against the reference image.
-- Shapes/dtypes: 4D MREG (X, Y, Z, T). Images saved float32; masks saved uint8.
+- Shapes/dtypes: 4D MREG (X, Y, Z, T). Images saved float32.
 - TR: Pulled from NIfTI header (`header.get_zooms()[3]`) for Realign4d.
 - BIDS naming: Use `SubjectPaths.sub` (already includes "sub-") unless noted.
 
@@ -57,8 +58,9 @@ Public API
 - compute_mreg_mean
 - estimate_mregmean_to_t1
 - apply_mean_xfm_to_full_mreg
-- warp_masks_single_shot
+- export_bandpower_to_mni
 """
+
 
 import json
 from pathlib import Path
@@ -79,7 +81,6 @@ from dipy.align.transforms import (
 from .transforms import (
     TransformBook,
     apply_affine_to_ref,
-    apply_affine_then_warp_to_mni,
 )
 from .io import SubjectPaths, deriv_name
 from typing import Union
@@ -146,7 +147,7 @@ def realign_and_detrend_mreg(sp: SubjectPaths, overwrite: bool = False) -> None:
     realign_exists = out_realigned.exists()
     detrend_exists = out_detrended.exists()
     if realign_exists and detrend_exists and not overwrite:
-        pprint(f"[mreg] [SKIP] Realign/detrend exist for {subj}")
+        print(f"[mreg] [SKIP] Realign/detrend exist for {subj}")
         return
 
     img = nib.load(str(mreg_4d))
@@ -295,7 +296,6 @@ def compute_mreg_mean(mreg_4d: Path, sp, overwrite: bool = False) -> Path:
     mreg_dir.mkdir(parents=True, exist_ok=True)
     subj = sp.sub
 
-    detrended = mreg_dir / f"{subj}_space-MREG_class-brain_desc-detrended_bold.nii.gz"
     realigned = mreg_dir / f"{subj}_space-MREG_class-brain_desc-motionrealigned_bold.nii.gz"
     source_4d = realigned if realigned.exists() else Path(mreg_4d)
 
@@ -718,201 +718,152 @@ def _pick_mreg_ref_path(sp: SubjectPaths) -> Path:
 
     raise FileNotFoundError("No MREG reference found.")
 
+        
+# -------------------------------------------------------------
+# Band power export (MREG → MNI)
+# -------------------------------------------------------------
 
-# -------------------------------------------------------------
-# Masking (MREG/T1/MNI paths)
-# -------------------------------------------------------------
-def warp_masks_single_shot(
-    sp: SubjectPaths,
-    xfm: TransformBook,
-    also_mni: bool = True,
-    clip_with_mreg_mask: Path | None = None,
-) -> None:
+
+
+def export_bandpower_to_mni(
+    sp,
+    xfm,
+    *,
+    t1_path: Path,
+    overwrite: bool = False,
+) -> dict[str, Path]:
     """
-    Warp native-space masks → MREG (and optionally → MNI) in one pass.
-
-    Sources & transforms
-    --------------------
-    Masks (under `sp.masks_dir`, produced elsewhere, e.g., `seg.py`):
-      - TOF arteries : `*_space-TOF_class-arteries_desc-main_mask.nii.gz`
-      - MRV veins    : `*_space-MRV_class-veins_desc-main_mask.nii.gz`
-      - HT2w PVS     : `*_space-HT2w_class-pvs_desc-main_mask.nii.gz`
-    Required affine keys in `xfm`:
-      - `"tof_to_t1"`, `"mrv_to_t1"`, `"ht2w_to_t1"` (scan→T1)
-      - `"t1_to_mreg"` (T1→MREG)
-
     Parameters
     ----------
     sp : SubjectPaths
-        Provides `sub`, `masks_dir`, and access to the MREG reference via
-        `_pick_mreg_ref_path`.
+        Subject context (expects `sub`, `bandmaps_dir`).
     xfm : TransformBook
-        Mapping that yields file paths to 4×4 text matrices. Optionally:
-        `xfm.mni_ref_path` (MNI reference), `xfm._mapping_cache` (deformable
-        mapping for MNI export).
-    also_mni : bool, optional
-        If True and MNI resources exist, write MNI-space masks as well.
-    clip_with_mreg_mask : pathlib.Path or None, optional
-        If provided, a binary **MREG-space** brain mask used to AND-clip each
-        warped label before saving.
+        Must provide:
+          - 4×4 text affine 't1_to_mreg' (or 'mregmean_to_t1')
+          - `_mapping_cache` : saved T1↔MNI deformation with `.transform(...)`
+          - `mni_ref_path`   : canonical MNI reference NIfTI path
+    t1_path : pathlib.Path
+        Path to the **T1 image you want to use** (e.g., denoised T1).
+    overwrite : bool, optional
+        If False (default), skip writing when the MNI outputs already exist.
 
     Returns
     -------
-    None
+    dict[str, pathlib.Path]
+        Mapping of band token (and 'meanamp') to written MNI NIfTI paths.
 
     Files written
     -------------
-    - masks/sub-<ID>_space-MREG_class-arteries_desc-main_mask.nii.gz
-    - masks/sub-<ID>_space-MREG_class-veins_desc-main_mask.nii.gz
-    - masks/sub-<ID>_space-MREG_class-pvs_desc-main_mask.nii.gz
-    - masks/sub-<ID>_space-MNI_class-<klass>_desc-main_mask.nii.gz (optional)
+    - bandmaps/sub-<ID>_space-MNI_band-<BAND>_desc-power_map.nii.gz
+    - bandmaps/sub-<ID>_space-MNI_desc-meanamp_map.nii.gz
 
     Assumptions / Preconditions
     ---------------------------
-    - Composed affine scan→MREG is `(T1→MREG) @ (scan→T1)`.
-    - Resampling target is the MREG grid from `_pick_mreg_ref_path`.
-    - Label resampling uses nearest-neighbor; masks are thresholded > 0.5.
+    - Input maps exist on the **MREG grid**:
+      `*_space-MREG_band-*_desc-power_map.nii.gz` and (optionally)
+      `*_space-MREG_desc-meanamp_map.nii.gz`.
+    - The T1 used here (`t1_path`) matches the saved T1↔MNI mapping in `xfm`.
+    - Affine used is **MREG→T1** (prefer explicit; else inverse of T1→MREG).
+    - Linear interpolation is used for all resampling; outputs are float32 on
+      the MNI reference grid/affine.
 
     Warnings
     --------
-    - Missing masks or missing transforms are skipped with a warning.
-    - Output shapes are validated against the MREG grid (mismatch → RuntimeError).
+    - If T1↔MNI mapping does not correspond to `t1_path`, misalignment can
+      occur (ensure both belong to the same subject & T1 version).
+    - Repeated resampling may smooth band-power values slightly; if this is
+      critical, consider exporting once from the highest-fidelity source.
+
+    Raises
+    ------
+    FileNotFoundError
+        If `t1_path` is missing or no MREG band maps are found.
+    RuntimeError
+        If `xfm._mapping_cache` or required affines are missing.
+
+    Notes
+    -----
+    - Outputs are saved as float32 and adopt the MNI reference affine/header.
+    - The **band token** is preserved verbatim from source filenames.
+
     """
     sub = sp.sub
-    masks_dir = Path(sp.masks_dir)
+    out_paths: dict[str, Path] = {}
 
-    # native masks produced by seg.py
-    art_native = masks_dir / deriv_name(sub, "TOF", "arteries", "main", "mask")
-    vein_mrv = masks_dir / deriv_name(sub, "MRV", "veins", "main", "mask")
-    pvs_native = masks_dir / deriv_name(sub, "hT2w", "pvs", "main", "mask")
+    bandmaps_dir = Path(sp.bandmaps_dir)
+    bandmaps_dir.mkdir(parents=True, exist_ok=True)
 
-    # MREG reference grid (use mean if present, else the 4D bold)
-    mreg_ref = _pick_mreg_ref_path(sp)
+    have_any = any(bandmaps_dir.glob(f"{sub}_space-MREG_band-*_desc-power_map.nii.gz")) \
+               or (bandmaps_dir / f"{sub}_space-MREG_desc-meanamp_map.nii.gz").exists()
+    if not have_any:
+        print("[export→mni] No MREG-space band/meanamp maps found; nothing to export.")
+        return {}
 
-    # Optional: load the EPI brain mask on the MREG grid (once)
-    epi_mask_bool = None
-    if clip_with_mreg_mask is not None and Path(clip_with_mreg_mask).exists():
-        ref_img = nib.load(str(mreg_ref))
-        ref_shape = ref_img.shape[:3]
-        ref_aff = ref_img.affine
+    # --- Load T1 that the caller decided (already denoised or not)
+    if not Path(t1_path).exists():
+        raise FileNotFoundError(f"[export→mni] t1_path does not exist: {t1_path}")
+    t1_img = nib.load(str(t1_path))
 
-        epi_img = nib.load(str(clip_with_mreg_mask))
-        # Align mask to the exact MREG grid if needed (nearest)
-        if (epi_img.shape[:3] != ref_shape) or (
-            not np.allclose(epi_img.affine, ref_aff, atol=1e-3)
-        ):
-            
-            epi_img = resample_from_to(epi_img, (ref_shape, ref_aff), order=0)
-            print("[warp] [WARN] EPI brain mask snapped to MREG grid ")
-        epi_mask_bool = epi_img.get_fdata() > 0.5
-    else:
-        ref_img = None
-        ref_shape = ref_aff = None
+    # --- MNI reference + T1→MNI mapping
+    if not getattr(xfm, "mni_ref_path", None):
+        raise RuntimeError("[export→mni] Missing xfm.mni_ref_path.")
+    mni_ref_img = nib.load(str(xfm.mni_ref_path))
 
-    def _to_mreg(native_mask: Path, src_to_t1_key: str, klass: str):
-        """
-        Warp a native-space label/mask to the MREG grid using precomputed
-        transforms (scan→T1, T1→MREG). Optionally write MNI-space outputs.
-        """
+    mapping = getattr(xfm, "_mapping_cache", None)
+    if mapping is None:
+        raise RuntimeError("[export→mni] Missing T1↔MNI mapping (_mapping_cache).")
 
-        if not native_mask or not Path(native_mask).exists():
-            print(f"[warp] [SKIP] Missing native {klass} mask")
-            return
-
-        out_mreg = masks_dir / deriv_name(sub, "MREG", klass, "main", "mask")
-        out_mreg.parent.mkdir(parents=True, exist_ok=True)
-
-        # Compose SCAN→MREG
+    # --- MREG→T1 affine (prefer explicit, else inverse of T1→MREG)
+    try:
+        A_mreg_to_t1 = np.loadtxt(str(xfm.get("mregmean_to_t1")))
+    except Exception:
         try:
-            A_src_to_t1 = np.loadtxt(str(xfm.get(src_to_t1_key)))
             A_t1_to_mreg = np.loadtxt(str(xfm.get("t1_to_mreg")))
+            A_mreg_to_t1 = np.linalg.inv(A_t1_to_mreg)
         except Exception as e:
-            raise RuntimeError(f"[warp] Required transform missing: {e}")
+            raise RuntimeError(f"[export→mni] Could not form MREG→T1 affine: {e}")
 
-        if A_src_to_t1.shape != (4, 4) or A_t1_to_mreg.shape != (4, 4):
-            raise ValueError("[warp] Expected 4x4 affines for src→T1 or T1→MREG.")
+    def _to_mni_float(src_path: Path, out_path: Path):
+        """Affine MREG→T1 (linear), then deform T1→MNI (linear), save float32."""
+        src_img = nib.load(str(src_path))
 
-        A_src_to_mreg = A_t1_to_mreg @ A_src_to_t1
-
-        moving = nib.load(str(native_mask))
-
-        # Reuse cached MREG reference when available
-        if "ref_img" in locals() and ref_img is not None:
-            _ref_img = ref_img
-            _ref_shape = ref_shape
-            _ref_aff = ref_aff
-        else:
-            _ref_img = nib.load(str(mreg_ref))
-            _ref_shape = _ref_img.shape[:3]
-            _ref_aff = _ref_img.affine
-
-        # Bake composed transform into moving header
-        moving_affine = A_src_to_mreg @ moving.affine
-        moving_img = nib.Nifti1Image(
-            moving.get_fdata(), moving_affine, moving.header.copy()
+        # Bake MREG→T1 into the header, then resample to T1 grid (linear)
+        baked = nib.Nifti1Image(
+            np.asarray(src_img.get_fdata(), dtype=np.float32),
+            A_mreg_to_t1 @ src_img.affine,
+            src_img.header.copy(),
         )
+        on_t1 = resample_from_to(baked, (t1_img.shape, t1_img.affine), order=1)
 
-        # Resample to MREG grid (nearest for labels)
-        resampled = resample_from_to(moving_img, (_ref_shape, _ref_aff), order=0)
-        resampled_data = (resampled.get_fdata() > 0.5).astype(np.uint8, copy=False)
+        # Deform to MNI with saved mapping (linear)
+        moved = mapping.transform(
+            np.asarray(on_t1.get_fdata(), dtype=np.float32), interpolation="linear"
+        )
+        out_img = nib.Nifti1Image(
+            moved.astype(np.float32, copy=False),
+            mni_ref_img.affine,
+            mni_ref_img.header,
+        )
+        out_img.header.set_data_dtype(np.float32)
 
-        # Optional clipping by EPI/MREG brain mask
-        if "epi_mask_bool" in locals() and epi_mask_bool is not None:
-            resampled_data = (
-                resampled_data.astype(bool) & epi_mask_bool
-            ).astype(np.uint8, copy=False)
+        if overwrite or (not out_path.exists()):
+            nib.save(out_img, str(out_path))
+            print(f"[export→mni] Saved → {out_path}")
+        else:
+            print(f"[export→mni] [SKIP] Exists: {out_path.name}")
 
-        # Save as uint8 on MREG grid
-        hdr = _ref_img.header.copy()
-        hdr.set_data_dtype(np.uint8)
-        nib.save(nib.Nifti1Image(resampled_data, _ref_aff, hdr), str(out_mreg))
+    # --- Mean-amplitude map
+    mean_src = bandmaps_dir / f"{sub}_space-MREG_desc-meanamp_map.nii.gz"
+    mean_out = bandmaps_dir / f"{sub}_space-MNI_desc-meanamp_map.nii.gz"
+    if mean_src.exists():
+        _to_mni_float(mean_src, mean_out)
+        out_paths["meanamp"] = mean_out
 
-        # Grid sanity-check
-        if resampled_data.shape != tuple(_ref_shape):
-            raise RuntimeError(
-                f"[warp] {klass} mask not on MREG grid: got {resampled_data.shape}, want {_ref_shape}"
-            )
+    # --- Band maps (discover whatever you wrote on MREG)
+    for src in sorted(bandmaps_dir.glob(f"{sub}_space-MREG_band-*_desc-power_map.nii.gz")):
+        band_token = src.name.split("_band-")[1].split("_")[0]  # preserve original name
+        out = bandmaps_dir / f"{sub}_space-MNI_band-{band_token}_desc-power_map.nii.gz"
+        _to_mni_float(src, out)
+        out_paths[band_token] = out
 
-        print(f"[warp] Saved {klass} mask in MREG space → {out_mreg}")
-
-        # Optional MNI output
-        if "also_mni" in locals() and also_mni:
-            if getattr(xfm, "mni_ref_path", None) and getattr(xfm, "_mapping_cache", None):
-                out_mni = masks_dir / deriv_name(sub, "MNI", klass, "main", "mask")
-                out_mni.parent.mkdir(parents=True, exist_ok=True)
-                apply_affine_then_warp_to_mni(
-                    native_mask,
-                    xfm.get(src_to_t1_key),
-                    xfm._mapping_cache,
-                    xfm.mni_ref_path,
-                    out_mni,
-                    is_label=True,
-                )
-                print(f"[warp] Saved {klass} mask in MNI space → {out_mni}")
-            else:
-                print(
-                    "[warp] also_mni=True but no MNI template/mapping; skipping MNI outputs."
-                )
-
-    # arteries (TOF)
-    if art_native.exists():
-        _to_mreg(art_native, "tof_to_t1", "arteries")
-
-    def _has_xfm(key: str) -> bool:
-        try:
-            xfm.get(key)
-            return True
-        except KeyError:
-            return False
-
-    # veins
-    if vein_mrv.exists() and _has_xfm("mrv_to_t1"):
-        _to_mreg(vein_mrv, "mrv_to_t1", "veins")
-    else:
-        print("[warp] [SKIP] No MRV→T1 transform or mask; skipping veins")
-
-    # pvs (hT2w)
-    if pvs_native.exists() and _has_xfm("ht2w_to_t1"):
-        _to_mreg(pvs_native, "ht2w_to_t1", "pvs")
-    else:
-        print("[warp] [SKIP] No HT2w→T1 transform or mask; skipping pvs")
+    return out_paths

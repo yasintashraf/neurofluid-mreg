@@ -24,10 +24,11 @@ Files written
   - sub-<ID>[_ses-<LABEL>]_space-<SPACE>_class-<CLASS>_desc-vesselness_map.nii.gz
   - sub-<ID>[_ses-<LABEL>]_space-<SPACE>_class-<CLASS>_desc-skeleton_mask.nii.gz
   - sub-<ID>[_ses-<LABEL>]_space-<SPACE>_class-<CLASS>_desc-main_mask.nii.gz
-
+  
 - derivatives/neurofluid-mreg/sub-<ID>/masks/
   - sub-<ID>[_ses-<LABEL>]_space-hT2w_class-pvs_desc-preproc_map.nii.gz
   - sub-<ID>[_ses-<LABEL>]_space-hT2w_class-brain_desc-coarsemask_mask.nii.gz
+  - sub-<ID>[_ses-<LABEL>]_space-MRV_class-veins_desc-prefrangi_image.nii.gz
 - derivatives/neurofluid-mreg/sub-<ID>/epc/  (only if `use_epc=True`)
   - sub-<ID>[_ses-<LABEL>]_space-hT2w_class-pvs_desc-epc_map.nii.gz
   - sub-<ID>[_ses-<LABEL>]_from-T1_to-hT2w_mode-affine_xfm.txt
@@ -55,6 +56,9 @@ Warnings
   the hT2w driver and continues.
 - EPC and small-scale Frangi may shift contrast; downstream thresholds may need
   retuning. Preprocessing uses robust percentile windowing and may clip tails.
+- All wrappers support `overwrite`: when False (default), processing is skipped if
+  the expected outputs already exist (early check).
+
 
 Public API
 ----------
@@ -119,6 +123,7 @@ def arteries_tof(
     prevent_leaking: bool = True,
     do_tophat: bool = True,
     tophat_size: int | None = None,
+    overwrite: bool = False, 
 ) -> dict:
     """
     Segment cerebral arteries from TOF MRI and write vesselness, mask, skeleton.
@@ -151,6 +156,8 @@ def arteries_tof(
         Apply white top-hat (arteries expected bright).
     tophat_size : int or None, optional
         Structural element radius; defaults to ~scale_max if None.
+    overwrite : bool, optional
+        If False (default), skip processing when the expected vesselness/skeleton/mask files already exist.
 
     Returns
     -------
@@ -174,6 +181,15 @@ def arteries_tof(
     - Excessive dilation may merge adjacent vessels undesirably.
     """
     print(f"[arteries] Input found → {tof_nii.name}")
+
+    # Compute expected outputs early and skip if present
+    vesselness_file, skeleton_file, mask_file = make_output_paths(
+        tof_nii, out_dir, class_name="arteries", space_override="TOF"
+    )
+    if (not overwrite) and all(p.exists() for p in (vesselness_file, skeleton_file, mask_file)):
+        print("[arteries] [SKIP] outputs exist (use overwrite=True to recompute)")
+        return {"vesselness": vesselness_file, "skeleton": skeleton_file, "mask": mask_file}
+
     # Load image volume
     image, affine, header = load_nifti(tof_nii)
 
@@ -198,11 +214,6 @@ def arteries_tof(
         tophat_size=tophat_size,
         do_dilate=do_dilate,
         dilate_rad=dilate_rad,
-    )
-
-    # Prepare output paths
-    vesselness_file, skeleton_file, mask_file = make_output_paths(
-        tof_nii, out_dir, class_name="arteries", space_override="TOF"
     )
 
     # Save outputs (float32 for vesselness, uint8 for masks)
@@ -248,6 +259,7 @@ def veins_mrv(
     do_tophat: bool = False,
     tophat_size: int | None = 0,  # black top-hat for dark-vein inputs
     r2_post_median=1, 
+    overwrite: bool = False,
 ) -> dict:
     """
     Segment cerebral veins from MRV and write vesselness, mask, skeleton.
@@ -276,8 +288,8 @@ def veins_mrv(
         Strategy to build the input for vesselness.
     echo_times : list of float or None, optional
         Echo times (consistent units) if known; else inferred ordering 1..E.
-    select_gamma_auto, auto_gamma_fraction : bool or float, optional
-        Auto-γ configuration for Frangi.
+    select_gamma_auto, cortical_auto_gamma_fraction, deep_auto_gamma_fraction : bool or float, optional
+        Auto-γ configuration for Frangi (per-bank fractions).
     alpha, beta, gamma : float, optional
         Frangi parameters.
     cortical_sigmas_mm, deep_sigmas_mm : tuple of float, optional
@@ -290,6 +302,8 @@ def veins_mrv(
         Optional black/white top-hat before vesselness.
     r2_post_median : int, default 1
         Radius (voxels) for a single 3D median applied only to R2* fusion.    
+    overwrite : bool, optional
+        If False (default), skip processing when the expected vesselness/skeleton/mask files already exist.
 
     Returns
     -------
@@ -302,6 +316,7 @@ def veins_mrv(
       - sub-<ID>[_ses-<LABEL>]_space-MRV_class-veins_desc-vesselness_map.nii.gz
       - sub-<ID>[_ses-<LABEL>]_space-MRV_class-veins_desc-skeleton_mask.nii.gz
       - sub-<ID>[_ses-<LABEL>]_space-MRV_class-veins_desc-main_mask.nii.gz
+      - sub-<ID>[_ses-<LABEL>]_space-MRV_class-veins_desc-prefrangi_image.nii.gz
 
     Assumptions / Preconditions
     ---------------------------
@@ -317,6 +332,15 @@ def veins_mrv(
     # Utilities (helpers local to this wrapper)
     # -------------------------------------------------------------
     print(f"[veins] Input found → {Path(mrv_nii).name if isinstance(mrv_nii, Path) else 'stack'}")
+
+    vesselness_file, skeleton_file, mask_file = make_output_paths(
+        mrv_nii, out_dir, class_name="veins", space_override="MRV")
+    
+    # Compute expected outputs early and skip if present
+    if (not overwrite) and all(p.exists() for p in (vesselness_file, skeleton_file, mask_file)):
+        print("[veins] [SKIP] outputs exist (use overwrite=True to recompute)")
+        return {"vesselness": vesselness_file, "skeleton": skeleton_file, "mask": mask_file}
+
     echo_paths: list[Path] = []
     def _voxel_size_mm(aff: np.ndarray) -> float:
         vs = np.sqrt((aff[:3, :3] ** 2).sum(axis=0))
@@ -523,7 +547,7 @@ def veins_mrv(
         diffs = np.diff(np.sort(sigmas_vox))
         return float(np.clip(diffs.min(), 0.3, 0.7))
 
-    step_c, step_d = _step(cort_vox), _step(deep_vox)
+    _, step_d = _step(cort_vox), _step(deep_vox)
     black_ridges = not bright_input
 
     # --- Dual-scale vesselness (cortical optional, deep required) ---
@@ -552,22 +576,22 @@ def veins_mrv(
 
     # Optionally compute CORTICAL (you can comment this whole block; fallback below works)
     v_cort = None
-    try:
-        v_cort = frangi_vesselness(
-            pre_frangi_img,
-            scale_min=min(cort_vox),
-            scale_max=max(cort_vox),
-            scale_step=step_c,
-            alpha=alpha,
-            beta=beta,
-            gamma=gamma,
-            black_ridges=black_ridges,
-            select_gamma_auto=select_gamma_auto,
-            auto_gamma_fraction=cortical_auto_gamma_fraction,  # keep your per-bank setting
-        ).astype(np.float32)
-    except Exception:
-        # If cortical computation is removed or fails, we just skip it.
-        v_cort = None
+    # try:
+    #     v_cort = frangi_vesselness(
+    #         pre_frangi_img,
+    #         scale_min=min(cort_vox),
+    #         scale_max=max(cort_vox),
+    #         scale_step=step_c,
+    #         alpha=alpha,
+    #         beta=beta,
+    #         gamma=gamma,
+    #         black_ridges=black_ridges,
+    #         select_gamma_auto=select_gamma_auto,
+    #         auto_gamma_fraction=cortical_auto_gamma_fraction,  # keep your per-bank setting
+    #     ).astype(np.float32)
+    # except Exception:
+    #     # If cortical computation is removed or fails, we just skip it.
+    #     v_cort = None
 
     # Normalize per-bank (only if present)
     v_deep = _p99_norm_pos(v_deep)
@@ -614,10 +638,6 @@ def veins_mrv(
     # -------------------------------------------------------------
     # Save artifacts
     # -------------------------------------------------------------
-    vesselness_file, skeleton_file, mask_file = make_output_paths(
-        mrv_nii, out_dir, class_name="veins", space_override="MRV"
-    )
-
     pre_frangi_file = vesselness_file.with_name(
         vesselness_file.name.replace("desc-vesselness_map", "desc-prefrangi_image")
     )
@@ -637,12 +657,13 @@ def pvs_ht2w(
     ht2w_nii: Path,
     out_dir: Path,
     *,
-    use_epc: bool = False,                 # enable EPC driver
-    t1_path: Path | None = None,           # raw (or already denoised) T1 path; REQUIRED if use_epc=True
-    t1_do_n4: bool = True,                 # run N4 on T1 before registration (recommended)
+    use_epc: bool = False,                 
+    t1_path: Path | None = None,         
+    t1_do_n4: bool = True,               
     t1_robust_pct: tuple[float,float] = (1.0, 99.0),
-    write_preproc_artifacts: bool = True,  # write desc-preproc_map/coarsemask_mask into masks/
-    write_epc_artifacts: bool = True       # write EPC map + affine into epc/
+    write_preproc_artifacts: bool = True,  
+    write_epc_artifacts: bool = True ,      
+    overwrite: bool = False,
 ) -> dict:
     """
     Segment perivascular spaces (PVS) from heavy-T2w (hT2w) and write
@@ -679,6 +700,8 @@ def pvs_ht2w(
     write_epc_artifacts : bool, optional
         If True and EPC is used, write the EPC map and the T1→hT2w affine into
         an `epc/` sibling folder.
+    overwrite : bool, optional
+        If False (default), skip processing when the expected vesselness/skeleton/mask files already exist.
 
     Returns
     -------
@@ -725,6 +748,16 @@ def pvs_ht2w(
       future releases; keep `write_*_artifacts=True` for QC while iterating.
     """
     print(f"[pvs] Input found → {ht2w_nii.name}")
+ 
+ 
+    vesselness_file, skeleton_file, mask_file = make_output_paths(
+    ht2w_nii, out_dir, class_name="pvs", space_override="hT2w")
+
+    # Compute expected outputs early and skip if present    
+    if (not overwrite) and all(p.exists() for p in (vesselness_file, skeleton_file, mask_file)):
+        print("[pvs] [SKIP] outputs exist (use overwrite=True to recompute)")
+        return {"vesselness": vesselness_file, "skeleton": skeleton_file, "mask": mask_file}
+ 
     pre_img, pre_mask, affine, header = pvs_preprocess_ht2w(
         ht2w_nii,
         clip_low=1.0,
@@ -795,9 +828,6 @@ def pvs_ht2w(
         )
 
     # --- write exactly as before (BIDS-style paths)
-    vesselness_file, skeleton_file, mask_file = make_output_paths(
-        ht2w_nii, out_dir, class_name="pvs", space_override="hT2w"
-    )
     save_nifti(vesselness.astype(np.float32), affine, header, vesselness_file)
     save_nifti(mask.astype(np.uint8),        affine, header, mask_file)
     save_nifti(skeleton.astype(np.uint8),    affine, header, skeleton_file)

@@ -14,52 +14,72 @@ Pipeline steps
 --------------
 1. Load 4D MREG, read TR from JSON, compute voxelwise rFFT amplitudes.
 2. Write per-band amplitude-sum maps and a global mean-amplitude map.
-3. (Optional) Build distance-based clusters from a distance map.
+3. Build distance-based clusters from a distance map (MREG or MNI grid).
 4. Analyze binned means across clusters (ANOVA/Kruskal) and plot.
 5. Summarize mean spectra per cluster and plot up to `max_hz`.
 6. Fit continuous regressions of log1p(band power) vs distance and plot.
-7. (Optional) Regress log1p(band power) vs radii at centerline voxels.
+7. Regress log1p(band power) vs radii at centerline voxels (MREG or MNI).
 
 Inputs / Outputs
 ----------------
-Inputs  : SubjectPaths (BIDS roots/IDs and derivative dirs); 4D MREG
-          (`sp.func_mreg_bold` + JSON sidecar); distance map(s); class masks.
-Outputs : NIfTI band maps, integer cluster masks, NPZ spectra, CSV stats,
-          and PNG figures, all under `derivatives/neurofluid-mreg/sub-<ID>/`.
+Inputs
+    - `SubjectPaths` (BIDS roots/IDs and derivative dirs).
+    - 4D MREG BOLD (`sp.func_mreg_bold` + JSON sidecar with TR).
+    - Bandpower maps in space-MREG or space-MNI, depending on analysis.
+    - Distance maps (mm) in MREG or MNI space.
+    - Optional brain masks and radius maps (mm).
+
+Outputs
+    - NIfTI band maps and mean-amplitude maps (MREG).
+    - Integer cluster masks (same space as distance map).
+    - NPZ spectra summaries.
+    - CSV statistics (binned, continuous, radius vs power).
+    - PNG figures for QC and summaries.
 
 Files written
 -------------
 - bandmaps/
   `sub-<ID>_space-MREG_band-<BAND>_desc-power_map.nii.gz`
   `sub-<ID>_space-MREG_desc-meanamp_map.nii.gz`
+  `sub-<ID>_space-MREG_freq-<FREQ>_desc-amp_map.nii.gz`
 - clusters/
-  `sub-<ID>_space-MREG_class-<CLASS>_desc-clusters_mask.nii.gz`
+  `sub-<ID>_space-<SPACE>_class-<CLASS>_desc-clusters_mask.nii.gz`
 - spectra/
-  `sub-<ID>_space-MREG_class-<CLASS>_desc-cluster_spectra.npz`
+  `sub-<ID>_space-<SPACE>_class-<CLASS>_desc-cluster_spectra.npz`
 - stats/
-  `sub-<ID>_space-MREG_class-<CLASS>_desc-binned_stats.csv` (semicolon CSV)
-  `sub-<ID>_space_MREG_class-<CLASS>-desc-continuous_stats.csv` (semicolon CSV)
-  `sub-<ID>_space-MREG_class-<CLASS>_desc-radius_vs_power.csv` (comma CSV)
+  `sub-<ID>_space-<SPACE>_class-<CLASS>_desc-binned_stats.csv`
+  `sub-<ID>_space-<SPACE>_class-<CLASS>-desc-continuous_stats.csv`
+  `sub-<ID>_space-<SPACE>_class-<CLASS>_desc-radius_vs_power.csv`
+  (all CSVs are semicolon-delimited)
 - figures/
-  `sub-<ID>_space-MREG_class-<CLASS>_desc-binned_bandpower.png`
-  `sub-<ID>_space-MREG_class-<CLASS>_desc-cluster_spectra.png`
-  `sub-<ID>_space-MREG_class-<CLASS>_band-<BAND>-desc-continuous.png`
-  `sub-<ID>_space-MREG_class-<CLASS>_desc-radius_vs_power.png`
+  `sub-<ID>_space-<SPACE>_class-<CLASS>_desc-binned_bandpower.png`
+  `sub-<ID>_space-<SPACE>_class-<CLASS>_desc-cluster_spectra.png`
+  `sub-<ID>_space-<SPACE>_class-<CLASS>_band-<BAND>-desc-continuous.png`
+  `sub-<ID>_space-<SPACE>_class-<CLASS>_desc-radius_vs_power.png`
 
 Assumptions / Preconditions
 ---------------------------
-- Space: Operates in **native MREG space**. If affines differ, continue in
-  image space after snapping masks/labels with **nearest-neighbor**.
-- TR: Read exactly from the JSON sidecar; header 4th zoom is a last resort.
-- Shapes/dtypes: Band maps/mean maps are float32; cluster labels are int16;
-  spectra NPZ store float arrays; CSVs use semicolon except radii CSV (comma).
-- BIDS naming: Uses `sub-<ID>_space-MREG_*` stems for NIfTI derivatives.
+- Space: All time-series–driven analyses operate on the **native MREG grid**.
+  Cluster and distance maps may be in MREG or MNI; space is inferred from the
+  filename and used only for naming. When required, labels/masks are snapped
+  to the MREG grid with nearest-neighbor interpolation for time-series
+  sampling.
+- TR: Read from the JSON sidecar (`"RepetitionTime"`, seconds). Header 4th
+  zoom is used as a last resort.
+- Shapes/dtypes: Band maps and mean-amplitude maps are float32; cluster labels
+  are int16; spectra NPZ contain float arrays; CSVs are semicolon-delimited.
+- BIDS naming: Uses `sub-<ID>_space-<SPACE>_class-<CLASS>_...` stems for NIfTI
+  and CSV derivatives wherever class-specific outputs are written.
 
 Warnings
 --------
-- Nearest-neighbor snapping preserves labels but may alias boundaries.
-- NaNs may be introduced (brain masking) and must be handled downstream.
-- No multiple-comparison control is applied in the statistical outputs.
+- Nearest-neighbor snapping preserves labels but may alias boundaries when
+  resampling cluster or mask images.
+- NaNs may be introduced (e.g., outside brain masks) and must be handled by
+  downstream consumers.
+- No multiple-comparison control is applied to ANOVA/Kruskal p-values.
+- Bandpower maps represent **sums of amplitude** across FFT bins within each
+  band; they are not power spectral density estimates.
 
 Public API
 ----------
@@ -83,7 +103,6 @@ import matplotlib.pyplot as plt
 import statsmodels.api as sm
 
 from nibabel.processing import resample_from_to
-from patsy import dmatrix
 from scipy.stats import f_oneway, kruskal, linregress, spearmanr
 from sklearn.linear_model import HuberRegressor
 
@@ -111,61 +130,39 @@ DIST_BINS_DEFAULT = [0, 2, 5, 10, "max"]
 ATOL_DEFAULT: float = 1e-3
 MASK_THR_DEFAULT: float = 0.5
 
+
 # -------------------------------------------------------------
 # I/O helpers (BIDS naming, reference resolution)
 # -------------------------------------------------------------
-def _resolve_mreg_ref(sp) -> nib.Nifti1Image:
+def _infer_space_from_path(path: Path, default: str = "MREG") -> str:
     """
-    Resolve a 3D MREG reference image for saving/aligning outputs.
-
-    Preference order
-    ----------------
-    1) `sp.mreg_meanamp_path`
-    2) `sp.mreg_mean_path`
-    3) `sp.mreg_ref_path`
-    4) `<bandmaps>/<sub>_space-MREG_desc-meanamp_map.nii.gz`
-    5) `<mreg>/<sub>_space-MREG_class-brain_desc-mean_map.nii.gz`
-    6) `sp.func_mreg_bold` (4D; only geometry used)
+    Infer imaging space token ("MNI" or "MREG") from a file path.
 
     Parameters
     ----------
-    sp : SubjectPaths
-        Subject context with paths. Expected attributes (if present):
-        `mreg_meanamp_path`, `mreg_mean_path`, `mreg_ref_path`,
-        `bandmaps_dir`, `mreg_dir`, `func_mreg_bold`, and `sub`.
+    path : pathlib.Path
+        Path whose string representation may contain `_space-MNI` or
+        `_space-MREG`.
+    default : str, optional
+        Fallback space token when no explicit match is found. Default is
+        `"MREG"`.
 
     Returns
     -------
-    nib.Nifti1Image
-        The chosen reference image. If a 4D BOLD is used, only the geometry
-        (affine and first three dimensions) is intended.
+    str
+        `"MNI"`, `"MREG"`, or `default` when no explicit token is detected.
 
-    Raises
-    ------
-    FileNotFoundError
-        If none of the locations above exist.
+    Warnings
+    --------
+    - This is a simple substring-based heuristic; if filenames diverge from
+      the `space-<SPACE>` convention, `default` is returned.
     """
-    # SubjectPaths attributes (if present)
-    for attr in ("mreg_meanamp_path", "mreg_mean_path", "mreg_ref_path"):
-        p = getattr(sp, attr, None)
-        if p and Path(p).exists():
-            return nib.load(str(p))
-
-    # On-disk fallbacks
-    meanamp = Path(sp.bandmaps_dir) / f"{sp.sub}_space-MREG_desc-meanamp_map.nii.gz"
-    if meanamp.exists():
-        return nib.load(str(meanamp))
-
-    # brain mean in mreg dir (uses your deriv_name convention)
-    mean = Path(sp.mreg_dir) / deriv_name(sp.sub, "MREG", "brain", "mean", "map")
-    if mean.exists():
-        return nib.load(str(mean))
-
-    # Last resort: 4D BOLD (use its 3D grid)
-    if getattr(sp, "func_mreg_bold", None) and Path(sp.func_mreg_bold).exists():
-        return nib.load(str(sp.func_mreg_bold))
-
-    raise FileNotFoundError("No MREG reference found (meanamp/mean/4D BOLD).")
+    s = str(path)
+    if "space-MNI" in s or "_space-MNI" in s:
+        return "MNI"
+    if "space-MREG" in s or "_space-MREG" in s:
+        return "MREG"
+    return default
 
 
 # -------------------------------------------------------------
@@ -178,8 +175,9 @@ def _load_mreg_data(sp):
     Parameters
     ----------
     sp : SubjectPaths
-        Must provide `func_mreg_bold` pointing to `<...>_task-mreg_bold.nii.gz`
-        with an adjacent JSON sidecar containing `"RepetitionTime"`.
+        Must provide `func_mreg_bold` pointing to a MREG BOLD NIfTI with an
+        adjacent JSON sidecar containing `"RepetitionTime"` in seconds. If
+        detrended/motionrealigned derivatives exist, they are preferred.
 
     Returns
     -------
@@ -194,17 +192,15 @@ def _load_mreg_data(sp):
 
     Assumptions / Preconditions
     ---------------------------
-    - TR is read from the JSON sidecar if present; header 4th zoom is fallback.
-    - Data are loaded as float32; rFFT is along time.
+    - TR (s) is read from the JSON sidecar if present; header 4th zoom
+      (seconds) is used as a fallback.
+    - Data are loaded as float32 and demeaned along the time axis per voxel.
 
     Warnings
     --------
     - If multiple candidate MREG files exist, the first existing path in the
-      preference list is used.
-
-    Notes
-    -----
-    - Each voxel time series is demeaned before rFFT.
+      internal preference list is used.
+    - No temporal filtering is applied here beyond demeaning.
     """
     mreg_dir = Path(sp.mreg_dir)
     sub = sp.sub
@@ -239,7 +235,7 @@ def _load_mreg_data(sp):
             info = json.load(f)
         TR = info.get("RepetitionTime")
     if TR is None:
-        TR = float(img.header.get_zooms()[3])  # safe fallback
+        TR = float(img.header.get_zooms()[3])  # safe fallback (seconds)
 
     freqs = np.fft.rfftfreq(nt, d=TR)
     amp = np.abs(np.fft.rfft(ts, axis=1)) / nt
@@ -266,26 +262,32 @@ def compute_bandpower_maps(
     Parameters
     ----------
     sp : SubjectPaths
-        Provides derivative dirs (`bandmaps_dir`) and MREG paths.
+        Provides derivative directories (e.g., `bandmaps_dir`) and MREG
+        paths (`mreg_dir`, `func_mreg_bold`).
     tr : float
         Ignored. TR is read from the JSON sidecar in `_load_mreg_data`.
-    bands : dict[str, tuple[float, float]] | None
-        Frequency bands in Hz. If None, use `BANDS_DEFAULT`.
-    mask_path : Path | None
-        Optional brain mask in **MREG** space; snapped with nearest if needed.
+        Preserved for backward compatibility.
+    bands : dict[str, tuple[float, float]] or None
+        Mapping from band name to `(low_hz, high_hz)` inclusive range.
+        If None, `BANDS_DEFAULT` is used.
+    mask_path : pathlib.Path or None
+        Optional brain mask NIfTI in **MREG** space. If the mask grid/affine
+        does not match the MREG reference within `atol`, it is snapped with
+        nearest-neighbor interpolation.
     overwrite : bool, default False
-        If False, skip writing existing outputs.
+        If False, existing band/mean maps are not recomputed.
     atol : float, default 1e-3
         Absolute tolerance for affine equality when checking mask alignment
-        to the MREG grid. If exceeded, the mask is snapped with nearest-neighbor.
+        to the MREG grid.
     mask_threshold : float, default 0.5
         Threshold applied to the (possibly resampled) brain mask to create a
         boolean mask; values > mask_threshold are treated as inside brain.
-    
+
     Returns
     -------
     dict[str, Path]
-        Mapping `{band_name: band_map_path}`.
+        Mapping `{band_name: band_map_path}` for all successfully written
+        bands.
 
     Files written
     -------------
@@ -295,14 +297,15 @@ def compute_bandpower_maps(
 
     Assumptions / Preconditions
     ---------------------------
-    - Space: **MREG** grid. If mask is off-grid, snap with nearest.
-    - Values are amplitude sums (a.u.) across FFT bins within band.
-    - Mask alignment uses `atol` for affine comparisons; masks are snapped
-      with nearest-neighbor when tolerance is exceeded.
+    - Space: Outputs are on the MREG grid. If a mask is off-grid, it is
+      snapped with nearest-neighbor.
+    - Values represent amplitude sums (arbitrary units) across FFT bins
+      within each band.
 
     Warnings
     --------
-    - NaNs may be introduced outside brain if `mask_path` is provided.
+    - NaNs may be introduced outside the brain if `mask_path` is provided;
+      downstream consumers should handle NaNs explicitly.
     """
     sp.bandmaps_dir.mkdir(parents=True, exist_ok=True)
 
@@ -384,25 +387,28 @@ def frequency_map(sp, freq_hz, overwrite=False):
     Parameters
     ----------
     sp : SubjectPaths
-        Must provide `func_mreg_bold` and `bandmaps_dir`.
+        Must provide `func_mreg_bold`, `mreg_dir`, and `bandmaps_dir`.
     freq_hz : float
-        Frequency of interest (Hz); nearest rFFT bin is used.
+        Frequency of interest in Hz; the nearest rFFT bin is used.
     overwrite : bool, default False
-        If False, skip when output already exists.
+        If False, the map is not recomputed when an existing file is found.
 
     Returns
     -------
-    Path
-        Path to `sub-<ID>_space-MREG_freq-{freq_hz:.3f}_desc-amp_map.nii.gz`.
+    pathlib.Path
+        Path to
+        `sub-<ID>_space-MREG_freq-{freq_hz:.3f}_desc-amp_map.nii.gz`.
 
     Files written
     -------------
     - bandmaps/
-      `sub-<ID>_space-MREG_freq-{freq_hz:.3f}_desc-amp_map.nii.gz` (float32)
+      `sub-<ID>_space-MREG_freq-{freq_hz:.3f}_desc-amp_map.nii.gz`
+      (float32; amplitude |rFFT|/N).
 
     Assumptions / Preconditions
     ---------------------------
     - Amplitude is |rFFT|/N after voxelwise demean.
+    - TR and frequency axis are derived by `_load_mreg_data`.
     """
     amp, freqs, affine, vol_shape = _load_mreg_data(sp)
     idx = int(np.argmin(np.abs(freqs - freq_hz)))
@@ -416,55 +422,69 @@ def frequency_map(sp, freq_hz, overwrite=False):
         print(f"[bandmaps] Saved → {amp_path}")
     else:
         print(f"[bandmaps] [SKIP] Exists: {amp_path.name}")
-        
+
     return amp_path
 
 
 # -------------------------------------------------------------
 # Thresholding / post-processing / clustering
 # -------------------------------------------------------------
-def make_distance_clusters(sp, dist_map_path, klass: str, bins=None, overwrite=False, *, atol: float = ATOL_DEFAULT):
+def make_distance_clusters(
+    sp,
+    dist_map_path,
+    klass: str,
+    bins=None,
+    overwrite=False,
+    *,
+    atol: float = ATOL_DEFAULT,
+):
     """
     Create distance-based cluster labels per class and write a class-tagged
-    integer mask in MREG space.
+    integer mask on the same grid as the distance map.
 
     Parameters
     ----------
     sp : SubjectPaths
-        Provides `sub` and `clusters_dir`. Reference space is resolved
-        internally for saving geometry.
-    dist_map_path : str or os.PathLike
-        Path to a 3D distance NIfTI (float), aligned to the MREG grid.
+        Provides `sub` and `clusters_dir`. The distance-map grid/affine is
+        used as the reference for outputs.
+    dist_map_path : str or pathlib.Path
+        Path to a 3D distance NIfTI (float, mm). The file name is inspected
+        for a space token (e.g., `space-MNI` or `space-MREG`) which is used
+        in output filenames.
     klass : {'arteries', 'veins', 'pvs'}
         Vascular class token used in output filenames.
-    bins : sequence[float] or None
-        Monotonic bin edges (mm). If last edge is `'max'`, it is replaced by
-        the image maximum. If None, uses `DIST_BINS_DEFAULT`.
+    bins : sequence[float or str] or None
+        Monotonic bin edges (mm). If the last edge is `"max"`, it is
+        replaced by the image maximum. If None, `DIST_BINS_DEFAULT`
+        is used.
     overwrite : bool, default False
-        If False, skip when output exists.
+        If False, labels are not recomputed when the output file already
+        exists.
     atol : float, default 1e-3
-        Absolute tolerance for affine equality when verifying the distance-map
-    grid against the chosen MREG reference. Labels are snapped with nearest-
-    neighbor when tolerance is exceeded.
+        Absolute tolerance for affine equality when verifying grids against
+        other images (reserved for future extension).
 
     Returns
     -------
     pathlib.Path
-        `sub-<ID>_space-MREG_class-<klass>_desc-clusters_mask.nii.gz`.
+        Path to
+        `sub-<ID>_space-<SPACE>_class-<klass>_desc-clusters_mask.nii.gz`.
 
     Files written
     -------------
     - clusters/
-      `sub-<ID>_space-MREG_class-<klass>_desc-clusters_mask.nii.gz` (int16)
+      `sub-<ID>_space-<SPACE>_class-<klass>_desc-clusters_mask.nii.gz`
+      (int16; -1 for invalid/NaN distance).
 
     Assumptions / Preconditions
     ---------------------------
-    - Distance map in mm; NaNs are allowed and digitized to `-1` by `nan_to_num`.
+    - Distance map values are in mm. NaNs are allowed and digitized to `-1`
+      via `labels = -1` wherever distance is non-finite.
 
     Warnings
     --------
-    - Label resampling occurs when shape/affine mismatch exceeds `atol`
-      (nearest-neighbor; integer labels preserved).
+    - Bin edges are normalized and deduplicated; invalid or non-monotonic
+      specifications raise `ValueError`.
     """
     if bins is None:
         bins = DIST_BINS_DEFAULT
@@ -473,17 +493,16 @@ def make_distance_clusters(sp, dist_map_path, klass: str, bins=None, overwrite=F
     if not dist_path.exists():
         raise FileNotFoundError(f"Distance map not found: {dist_path}")
 
-    # Load distance map
+    space = _infer_space_from_path(dist_path, default="MREG")
+
+    # Load distance map; treat its grid as the anchor
     dist_img = nib.load(str(dist_path))
     dist = np.asarray(dist_img.get_fdata(), dtype=np.float32)
-
-    # Resolve MREG reference (shape & affine anchor)
-    ref_img = _resolve_mreg_ref(sp)
-    ref_shape = ref_img.shape[:3]
-    ref_aff = ref_img.affine
+    ref_aff = dist_img.affine
 
     # Handle 'max' in bins
     finite_max = float(np.nanmax(dist)) if np.isfinite(dist).any() else 0.0
+
     def _normalize_bins(bins_in, vmax):
         raw = []
         has_max = False
@@ -499,43 +518,30 @@ def make_distance_clusters(sp, dist_map_path, klass: str, bins=None, overwrite=F
         arr = np.unique(arr)
 
         if has_max:
-            # keep only edges ≤ vmax, then append vmax as the last edge
             arr = arr[arr <= (vmax + 1e-6)]
             if arr.size == 0 or arr[-1] < vmax:
                 arr = np.concatenate([arr, [np.float32(vmax)]])
-
-        if arr.size < 2:
-            raise ValueError(f"distance bin edges invalid after normalization: {arr}")
-        if np.any(np.diff(arr) <= 0):
-            raise ValueError(f"distance bin edges not strictly increasing: {arr}")
-
+        if arr.size < 2 or np.any(np.diff(arr) <= 0):
+            raise ValueError(f"distance bin edges invalid: {arr}")
         return arr
-    numeric_bins = _normalize_bins(bins, finite_max)        
 
-    # Digitize -> labels (bin index), map NaNs to -1 explicitly
+    numeric_bins = _normalize_bins(bins, finite_max)
+
+    # Digitize → labels (bin index), NaNs to -1
     valid = np.isfinite(dist)
     labels = np.full(dist.shape, -1, dtype=np.int16)
     if np.any(valid):
-        labels[valid] = np.digitize(dist[valid], numeric_bins, right=True).astype(np.int16) - 1
+        labels[valid] = (
+            np.digitize(dist[valid], numeric_bins, right=True).astype(np.int16) - 1
+        )
 
-
-    # Ensure labels are on MREG grid (nearest)
-    if (labels.shape != tuple(ref_shape)) or (
-        not np.allclose(dist_img.affine, ref_aff, atol=atol)
-    ):
-        lbl_src = nib.Nifti1Image(labels, dist_img.affine, dist_img.header)
-        lbl_res = resample_from_to(lbl_src, (ref_shape, ref_aff), order=0)
-        print("[clusters] [WARN] Labels snapped to MREG grid (nearest)")
-        labels = np.rint(lbl_res.get_fdata()).astype(np.int16, copy=False)
-
-    # Save
+    # Save on the SAME grid as the distance map
     sp.clusters_dir.mkdir(parents=True, exist_ok=True)
     out_path = Path(sp.clusters_dir) / deriv_name(
-        sp.sub, "MREG", klass, "clusters", "mask"
+        sp.sub, space, klass, "clusters", "mask"
     )
-
     if not out_path.exists() or overwrite:
-        hdr = ref_img.header.copy()
+        hdr = dist_img.header.copy()
         hdr.set_data_dtype(np.int16)
         nib.save(nib.Nifti1Image(labels, ref_aff, hdr), str(out_path))
         print(f"[clusters] Saved → {out_path}")
@@ -548,45 +554,55 @@ def make_distance_clusters(sp, dist_map_path, klass: str, bins=None, overwrite=F
 def analyze_binned(sp, labels_path, *, klass: str, bands=None, overwrite=False):
     """
     Compute per-cluster band means for a class (arteries/veins/pvs), run
-    ANOVA/Kruskal, and save class-specific CSV + figure.
+    ANOVA/Kruskal, and save a class-specific CSV plus figure.
 
     Parameters
     ----------
     sp : SubjectPaths
-        Must provide `bandmaps_dir`, `stats_dir`, `figures_dir`.
-    labels_path : str | Path
-        Path to integer label NIfTI in MREG space. Negative values ignored.
+        Must provide `bandmaps_dir`, `stats_dir`, and `figures_dir`.
+    labels_path : str or pathlib.Path
+        Path to an integer label NIfTI in MREG or MNI space. Negative values
+        are ignored. The space token is inferred from the filename and used
+        in output names.
     klass : {'arteries', 'veins', 'pvs'}
         Anatomical class token used in output filenames.
-    bands : dict[str, tuple[float, float]] | None
-        Frequency bands (Hz). If None, uses `BANDS_DEFAULT`.
+    bands : dict[str, tuple[float, float]] or None
+        Frequency bands (Hz). If None, `BANDS_DEFAULT` is used.
     overwrite : bool, default False
-        If False, skip when both outputs already exist.
+        If False, skip computation when both CSV and figure already exist.
 
     Returns
     -------
-    (Path, Path)
-        `(csv_path, fig_path)`.
+    (pathlib.Path, pathlib.Path)
+        `(csv_path, fig_path)` for the binned stats CSV and PNG figure.
 
     Files written
     -------------
     - stats/
-      `sub-<ID>_space-MREG_class-<klass>_desc-binned_stats.csv`
+      `sub-<ID>_space-<SPACE>_class-<klass>_desc-binned_stats.csv`
       (semicolon-delimited with columns: band;F;p_anova;H;p_kruskal)
     - figures/
-      `sub-<ID>_space-MREG_class-<klass>_desc-binned_bandpower.png`
+      `sub-<ID>_space-<SPACE>_class-<klass>_desc-binned_bandpower.png`
 
     Warnings
     --------
-    - Statistics computed only if ≥2 non-empty groups; otherwise NaNs recorded.
+    - Statistics are computed only when ≥2 non-empty groups exist; otherwise
+      NaNs are recorded in the CSV.
+    - Band maps are resampled linearly to the label grid when shape/affine
+      mismatches occur.
     """
+    if bands is None:
+        bands = BANDS_DEFAULT
+
+    space = _infer_space_from_path(Path(labels_path), default="MREG")
+
     if bands is None:
         bands = BANDS_DEFAULT
 
     labels_img = nib.load(str(labels_path))
     labels_data = labels_img.get_fdata().astype(int)
-    cluster_ids = np.unique(labels_data[~np.isnan(labels_data)])
-    cluster_ids = cluster_ids[cluster_ids >= 0]
+    cluster_ids = np.unique(labels_data[np.isfinite(labels_data)])
+    cluster_ids = [int(c) for c in cluster_ids if c >= 0]
     cluster_ids = sorted(cluster_ids)
 
     sp.stats_dir.mkdir(parents=True, exist_ok=True)
@@ -594,15 +610,15 @@ def analyze_binned(sp, labels_path, *, klass: str, bands=None, overwrite=False):
 
     stats_path = (
         sp.stats_dir
-        / f"{sp.sub}_space-MREG_class-{klass}_desc-binned_stats.csv"
+        / f"{sp.sub}_space-{space}_class-{klass}_desc-binned_stats.csv"
     )
     fig_path = (
         sp.figures_dir
-        / f"{sp.sub}_space-MREG_class-{klass}_desc-binned_bandpower.png"
+        / f"{sp.sub}_space-{space}_class-{klass}_desc-binned_bandpower.png"
     )
 
     if stats_path.exists() and fig_path.exists() and not overwrite:
-        print(f"[binned] Exists → {klass}; skipping.")
+        print(f"[binned] Exists → {klass} ({space}); skipping.")
         return stats_path, fig_path
 
     cluster_means = {}
@@ -611,23 +627,34 @@ def analyze_binned(sp, labels_path, *, klass: str, bands=None, overwrite=False):
     for band in bands:
         band_file = (
             sp.bandmaps_dir
-            / f"{sp.sub}_space-MREG_band-{band}_desc-power_map.nii.gz"
+            / f"{sp.sub}_space-{space}_band-{band}_desc-power_map.nii.gz"
         )
         if not band_file.exists():
-            warnings.warn(f"[binned] Band map not found for '{band}'; skipping.")
+            warnings.warn(
+                f"[binned] Band map not found for '{band}' in space {space}; skipping."
+            )
             continue
 
-        band_data = nib.load(str(band_file)).get_fdata()
+        # Align band map to labels grid if needed
+        band_img = nib.load(str(band_file))
+        band_dat = band_img.get_fdata()
+        if (band_img.shape != labels_img.shape) or (
+            not np.allclose(band_img.affine, labels_img.affine, atol=ATOL_DEFAULT)
+        ):
+            band_img = resample_from_to(
+                band_img, (labels_img.shape, labels_img.affine), order=1
+            )
+            band_dat = band_img.get_fdata()
+
         means = []
         samples = []
-
         for c in cluster_ids:
-            vals = band_data[labels_data == c]
-            vals = vals[~np.isnan(vals)]
+            vals = band_dat[labels_data == c]
+            vals = vals[np.isfinite(vals)]
             if vals.size == 0:
                 means.append(np.nan)
             else:
-                means.append(np.nanmean(vals))
+                means.append(float(np.nanmean(vals)))
                 samples.append(vals.ravel())
 
         cluster_means[band] = means
@@ -643,10 +670,9 @@ def analyze_binned(sp, labels_path, *, klass: str, bands=None, overwrite=False):
                 H, p_kw = np.nan, np.nan
         else:
             F, p_anova, H, p_kw = np.nan, np.nan, np.nan, np.nan
-
         stat_rows.append((band, F, p_anova, H, p_kw))
 
-    # Save stats CSV (semicolon for EU Excel)
+    # CSV (semicolon for EU Excel)
     with open(stats_path, "w", newline="") as csvfile:
         writer = csv.writer(csvfile, delimiter=";")
         writer.writerow(["band", "F", "p_anova", "H", "p_kruskal"])
@@ -654,20 +680,21 @@ def analyze_binned(sp, labels_path, *, klass: str, bands=None, overwrite=False):
             writer.writerow(row)
     print(f"[binned] Saved → {stats_path}")
 
-    # Plot band power by cluster
+    # Figure
     if not fig_path.exists() or overwrite:
         plt.figure(figsize=(8, 5))
         for band, means in cluster_means.items():
             plt.plot(cluster_ids, means, marker="o", label=band)
         plt.xlabel("Distance Cluster")
         plt.ylabel("Mean Band Power (a.u.)")
-        plt.title(f"Band Power by Distance Cluster ({klass})")
+        plt.title(f"Band Power by Distance Cluster ({klass}, {space})")
         plt.legend()
         plt.grid(True)
         plt.savefig(str(fig_path))
         plt.close()
+        print(f"[binned] Saved → {fig_path}")
     else:
-        print(f"[binned] [SKIP] Exists for class '{klass}': {fig_path.name}")
+        print(f"[binned] [SKIP] Exists: {fig_path.name}")
 
     return stats_path, fig_path
 
@@ -678,66 +705,99 @@ def analyze_binned(sp, labels_path, *, klass: str, bands=None, overwrite=False):
 def cluster_spectra(sp, labels_path, *, klass: str, max_hz=2.0, overwrite=False):
     """
     Compute mean amplitude spectrum per distance cluster for a class and
-    write NPZ + figure.
+    write an NPZ file plus a figure.
+
+    Labels may be in MNI or MREG space. When labels are not on the MREG
+    grid, they are snapped (nearest-neighbor) onto the MREG reference grid
+    for time-series sampling. Output files are tagged with the **original**
+    label space (e.g., `space-MNI`).
 
     Parameters
     ----------
     sp : SubjectPaths
-        Must provide `func_mreg_bold`, `spectra_dir`, `figures_dir`.
-    labels_path : str | Path
-        Path to cluster labels NIfTI (int) in MREG space.
+        Must provide `mreg_dir`, `spectra_dir`, `figures_dir`, and MREG
+        3D mean map (`sub-<ID>_space-MREG_class-brain_desc-mean_map.nii.gz`).
+    labels_path : str or pathlib.Path
+        Path to an integer label NIfTI with non-negative cluster IDs. The
+        space token is inferred from the filename and used in output names.
     klass : {'arteries', 'veins', 'pvs'}
-        Anatomical class token.
-    max_hz : float, default 2.0
-        Upper x-axis limit in Hz for the figure.
+        Vascular class token used in output filenames.
+    max_hz : float, optional
+        Upper frequency limit (Hz) for plotting. Default is 2.0.
     overwrite : bool, default False
-        If False, skip when outputs exist.
+        If False, skip NPZ/figure creation when they already exist.
 
     Returns
     -------
-    (Path, Path)
-        `(npz_path, fig_path)`.
+    (pathlib.Path, pathlib.Path)
+        `(npz_path, fig_path)` for the spectra NPZ and PNG figure.
 
     Files written
     -------------
     - spectra/
-      `sub-<ID>_space-MREG_class-<klass>_desc-cluster_spectra.npz`
-      (arrays: `freqs`, `spectra`, `cluster_ids`)
+      `sub-<ID>_space-<SPACE>_class-<klass>_desc-cluster_spectra.npz`
+      (fields: `freqs`, `spectra`, `cluster_ids`)
     - figures/
-      `sub-<ID>_space-MREG_class-<klass>_desc-cluster_spectra.png`
+      `sub-<ID>_space-<SPACE>_class-<klass>_desc-cluster_spectra.png`
 
-    Notes
-    -----
-    - Uses the same rFFT pipeline as band maps (|rFFT|/N after demean).
+    Assumptions / Preconditions
+    ---------------------------
+    - Cluster labels are integer-valued; negative IDs are ignored.
+    - MREG spectra are computed via `_load_mreg_data` (demeaned, |rFFT|/N).
+
+    Warnings
+    --------
+    - When labels are resampled to the MREG grid, nearest-neighbor
+      interpolation is used to preserve integer cluster IDs.
     """
-    labels_data = nib.load(str(labels_path)).get_fdata().astype(int)
-    cluster_ids = np.unique(labels_data[~np.isnan(labels_data)])
-    cluster_ids = cluster_ids[cluster_ids >= 0]
+    labels_path = Path(labels_path)
+    label_space = _infer_space_from_path(labels_path, default="MREG")  # e.g., "MNI" or "MREG"
+
+    # Load labels
+    lab_img = nib.load(str(labels_path))
+
+    # Load MREG reference (mean map defines target grid/affine)
+    mreg_mean = Path(sp.mreg_dir) / deriv_name(sp.sub, "MREG", "brain", "mean", "map")
+    mreg_ref = nib.load(str(mreg_mean))
+    ref_shape, ref_aff = mreg_ref.shape, mreg_ref.affine
+
+    # If labels are not already on MREG grid, snap them (NN) for sampling
+    if (lab_img.shape != ref_shape) or (
+        not np.allclose(lab_img.affine, ref_aff, atol=ATOL_DEFAULT)
+    ):
+        print(f"[spectra] Resampling labels from {label_space} → MREG grid (nearest).")
+        lab_img = resample_from_to(lab_img, (ref_shape, ref_aff), order=0)
+
+    labels_data = lab_img.get_fdata().astype(int)
+    cluster_ids = np.unique(labels_data[np.isfinite(labels_data)])
+    cluster_ids = [int(c) for c in cluster_ids if c >= 0]
     cluster_ids = sorted(cluster_ids)
 
+    # Load MREG time-series (demeaned, |rFFT|/N amplitude and freqs)
     amp, freqs, _, _ = _load_mreg_data(sp)
 
-    spectra_list = []
-    valid_clusters = []
+    spectra_list, valid_clusters = [], []
+    flat_labels = labels_data.ravel()
     for c in cluster_ids:
-        mask = labels_data.ravel() == c
+        mask = flat_labels == c
         if not np.any(mask):
             continue
         spec = amp[mask].mean(axis=0)
         spectra_list.append(spec)
         valid_clusters.append(c)
 
-    if spectra_list:
-        spectra_arr = np.vstack(spectra_list)
-    else:
-        spectra_arr = np.empty((0, freqs.size))
+    spectra_arr = (
+        np.vstack(spectra_list) if spectra_list else np.empty((0, freqs.size))
+    )
+    out_space = label_space  # keep original label space for filenames
 
+    # --- Save NPZ ---
     sp.spectra_dir.mkdir(parents=True, exist_ok=True)
     npz_path = (
         sp.spectra_dir
-        / f"{sp.sub}_space-MREG_class-{klass}_desc-cluster_spectra.npz"
+        / f"{sp.sub}_space-{out_space}_class-{klass}_desc-cluster_spectra.npz"
     )
-    if not npz_path.exists() or overwrite:
+    if (not npz_path.exists()) or overwrite:
         np.savez_compressed(
             str(npz_path),
             freqs=freqs,
@@ -748,21 +808,27 @@ def cluster_spectra(sp, labels_path, *, klass: str, max_hz=2.0, overwrite=False)
     else:
         print(f"[spectra] [SKIP] Exists: {npz_path.name}")
 
+    # --- Save Figure ---
     sp.figures_dir.mkdir(parents=True, exist_ok=True)
     fig_path = (
         sp.figures_dir
-        / f"{sp.sub}_space-MREG_class-{klass}_desc-cluster_spectra.png"
+        / f"{sp.sub}_space-{out_space}_class-{klass}_desc-cluster_spectra.png"
     )
-    if not fig_path.exists() or overwrite:
+    if (not fig_path.exists()) or overwrite:
         plt.figure(figsize=(8, 6))
         for c, spec in zip(valid_clusters, spectra_list):
             plt.plot(freqs, spec, label=f"Cluster {int(c)}")
         plt.xlim(0, max_hz)
         plt.xlabel("Frequency (Hz)")
         plt.ylabel("Amplitude (a.u.)")
-        plt.title(f"Full Spectrum by Distance Cluster ({klass})")
+        # Subtitle currently assumes label-space/MREG sampling pairing
+        plt.title(
+            f"Full Spectrum by Distance Cluster ({klass}, {out_space})\n"
+            f"labels in MNI; spectra sampled on MREG grid"
+        )
         plt.legend()
         plt.grid(True)
+        plt.tight_layout()
         plt.savefig(str(fig_path))
         print(f"[spectra] Saved → {fig_path}")
         plt.close()
@@ -775,7 +841,6 @@ def cluster_spectra(sp, labels_path, *, klass: str, max_hz=2.0, overwrite=False)
 # -------------------------------------------------------------
 # Continuous regression vs distance
 # -------------------------------------------------------------
-
 def analyze_continuous(
     sp,
     dist_map_path: Path,
@@ -787,7 +852,6 @@ def analyze_continuous(
     overwrite: bool = False,
     max_points_plot=200000,
 ) -> dict:
-    
     """
     Fit continuous regressions of log1p(band power) ~ distance (mm) for each
     band, writing per-band figures and a class-tagged CSV.
@@ -795,66 +859,78 @@ def analyze_continuous(
     Parameters
     ----------
     sp : SubjectPaths
-        Must provide `bandmaps_dir`, `stats_dir`, `figures_dir`, `sub`.
-    dist_map_path : str | Path
-        3D distance map NIfTI in **MREG** space (float, mm). Filename must
-        contain class token ("arteries", "veins", "pvs").
+        Must provide `bandmaps_dir`, `stats_dir`, `figures_dir`, and `sub`.
+    dist_map_path : str or pathlib.Path
+        3D distance map NIfTI in **MREG or MNI** space (float, mm). The space
+        token is inferred from the filename and used in output names. The
+        class token must appear in the filename ("arteries", "veins", "pvs").
     bands : dict[str, tuple[float, float]] | list[str] | None
-        Bands to analyze; defaults to keys of `BANDS_DEFAULT` if None.
-    mask_path : str | Path | None
-        Optional binary mask NIfTI (same grid/affine) to restrict voxels.
-    ref_curve : callable | None
-        Optional function `ref_curve(x)` for overlay.
+        Bands to analyze. If None, defaults to the keys of `BANDS_DEFAULT`.
+        If a list of strings is provided, these are treated as band names
+        matching existing bandmaps.
+    mask_path : str or pathlib.Path or None
+        Optional binary mask NIfTI (same grid/affine as `dist_map_path` or
+        resampled linearly) to restrict voxels.
+    ref_curve : callable or None
+        Optional function `ref_curve(x)` returning a reference curve for
+        overlay on the distance vs log1p(power) plots.
     ref_label : str, default "ref"
         Legend label for the reference curve.
     overwrite : bool, default False
-        If False, skip when CSV exists (and return parsed stats).
+        If False, skip when the CSV already exists (and return parsed stats).
     max_points_plot : int, default 200000
-        Max voxels sampled for fitting/plotting.
+        Maximum number of voxels sampled for fitting/plotting. When exceeded,
+        a random subset is used for performance.
 
     Returns
     -------
     dict
-        Summary with keys: `"class"` and `"per_band"` (slope/SE/p/R²/n).
+        Summary with keys:
+        - `"class"`: class token.
+        - `"per_band"`: dict mapping band name to a dict with fields
+          `beta`, `se`, `p`, `r2`, and `n`.
 
     Files written
     -------------
     - stats/
-      `sub-<ID>_space_MREG_class-<CLASS>-desc-continuous_stats.csv` (semicolon CSV)
-      columns: band;slope;intercept;r;p;stderr;n
+      `sub-<ID>_space-<SPACE>_class-<CLASS>-desc-continuous_stats.csv`
+      (semicolon CSV; columns: band;slope;intercept;r;p;stderr;n)
     - figures/
-      `sub-<ID>_space-MREG_class-<CLASS>_band-<BAND>-desc-continuous.png`
+      `sub-<ID>_space-<SPACE>_class-<CLASS>_band-<BAND>-desc-continuous.png`
 
     Assumptions / Preconditions
     ---------------------------
-    - Distances are in mm; band maps share the same MREG grid/affine.
+    - Distances are in mm; band maps share the same grid/affine as the
+      distance map or are resampled linearly to that grid.
+    - Bandpower is represented by amplitude-sum maps produced by
+      `compute_bandpower_maps`.
 
     Warnings
     --------
-    - Raises on shape/affine mismatch between band map and distance map.
-    - NaNs are removed before fitting; downsampling applied for large N.
-    - Continuous CSV is read/written with semicolon delimiter for Excel compatibility.
+    - Raises `ValueError` when the class token cannot be inferred from the
+      distance-map filename.
+    - Raises on shape/affine mismatch only indirectly (through resampling
+      logic); NaNs are removed before fitting, and downsampling is applied
+      for large N.
+    - Continuous CSV is read/written with semicolon delimiter for Excel
+      compatibility.
 
     Notes
     -----
-    - Linear stats are from OLS; robust Huber fit stabilizes visualization.
+    - Linear statistics are derived from OLS; a robust Huber fit is used to
+      stabilize the visual overlay.
     """
-    # Default band names
-    try:
-        from .analysis import BANDS_DEFAULT
-    except ImportError:
-        BANDS_DEFAULT = {
-            "cardiac": (0.80, 1.20),
-            "respiratory": (0.20, 0.30),
-            "LF": (0.027, 0.073),
-            "VLF": (0.010, 0.027),
-        }
+    # Default bands
     if bands is None:
         bands = list(BANDS_DEFAULT.keys())
     else:
         bands = list(bands)
 
-    # Determine class name from distance map filename
+    # Space from distance file name
+    dist_map_path = Path(dist_map_path)
+    space = _infer_space_from_path(dist_map_path, default="MREG")
+
+    # Class token from filename
     class_name = None
     fname = dist_map_path.name.lower()
     for cls in ("arteries", "veins", "pvs"):
@@ -864,16 +940,17 @@ def analyze_continuous(
     if class_name is None:
         raise ValueError(f"Unable to determine vessel class from {dist_map_path}")
 
-    # Output CSV path
-    out_csv = sp.stats_dir / f"{sp.sub}_space-MREG_class-{class_name}-desc-continuous_stats.csv"
+    # Output CSV (space-tagged)
+    out_csv = (
+        sp.stats_dir
+        / f"{sp.sub}_space-{space}_class-{class_name}-desc-continuous_stats.csv"
+    )
     if out_csv.exists() and not overwrite:
-        # Load existing CSV into result_dict and return
         result_dict = {"class": class_name, "per_band": {}}
         with open(out_csv, "r") as f:
             reader = csv.DictReader(f, delimiter=";")
             for row in reader:
                 band = row["band"]
-                # r is correlation; convert to R²
                 r_val = float(row["r"])
                 result_dict["per_band"][band] = {
                     "beta": float(row["slope"]),
@@ -884,87 +961,90 @@ def analyze_continuous(
                 }
         return result_dict
 
-    # Load distance map (mm)
+    # Load distance map
     dist_img = nib.load(str(dist_map_path))
     dist = dist_img.get_fdata().astype(np.float32)
 
-    # Load mask if provided
-    if mask_path is not None and mask_path.exists():
+    # Optional mask (snap to dist grid if needed)
+    if mask_path is not None and Path(mask_path).exists():
         mask_img = nib.load(str(mask_path))
+        if (mask_img.shape != dist_img.shape) or (
+            not np.allclose(mask_img.affine, dist_img.affine, atol=ATOL_DEFAULT)
+        ):
+            mask_img = resample_from_to(
+                mask_img, (dist_img.shape, dist_img.affine), order=0
+            )
         mask = mask_img.get_fdata().astype(bool)
     else:
         mask = np.ones_like(dist, dtype=bool)
 
-    # Prepare output container
     result_dict = {"class": class_name, "per_band": {}}
     stats_rows = []
 
-    # Iterate over bands
     for band in bands:
         band_path = (
             sp.bandmaps_dir
-            / f"{sp.sub}_space-MREG_band-{band}_desc-power_map.nii.gz"
+            / f"{sp.sub}_space-{space}_band-{band}_desc-power_map.nii.gz"
         )
         if not band_path.exists():
-            print(f"[continuous] [WARN] Missing band map for '{band}'; skipping")
+            print(
+                f"[continuous] [WARN] Missing band map for '{band}' in {space}; skipping"
+            )
             continue
+
         bm_img = nib.load(str(band_path))
         bandmap = bm_img.get_fdata().astype(np.float32)
 
-        # Validate grid/affine
+        # Align band map to dist grid when needed
         if (bm_img.shape != dist_img.shape) or (
-            not np.allclose(bm_img.affine, dist_img.affine)
+            not np.allclose(bm_img.affine, dist_img.affine, atol=ATOL_DEFAULT)
         ):
-            raise ValueError(
-                "Shape/affine mismatch:\n"
-                f"  dist: {dist_img.shape}\n"
-                f"  band: {bm_img.shape}\n"
-                f"{band_path} vs {dist_map_path}"
+            bm_img = resample_from_to(
+                bm_img, (dist_img.shape, dist_img.affine), order=1
             )
+            bandmap = bm_img.get_fdata().astype(np.float32)
 
-        # Mask NaNs and optional mask
-        valid_mask = np.isfinite(dist) & np.isfinite(bandmap) & (mask.astype(bool))
+        # Valid voxels
+        valid_mask = np.isfinite(dist) & np.isfinite(bandmap) & mask
         d_flat = dist[valid_mask].ravel().astype(np.float32)
         p_flat = bandmap[valid_mask].ravel().astype(np.float32)
         N = d_flat.size
         if N == 0:
-            print(f"[continuous] [WARN] No valid voxels for band '{band}'; skipping")
+            print(
+                f"[continuous] [WARN] No valid voxels for band '{band}'; skipping"
+            )
             continue
 
-        # Downsample for stability/plotting
+        # Downsample for stability/plot speed
         if N > max_points_plot:
-            np.random.seed(0)
-            idx = np.random.choice(N, size=max_points_plot, replace=False)
+            rng = np.random.default_rng(0)
+            idx = rng.choice(N, size=max_points_plot, replace=False)
             d_sub = d_flat[idx]
             p_sub = p_flat[idx]
         else:
             d_sub = d_flat
             p_sub = p_flat
 
-        # Transform + prepare data
-        y = np.log1p(p_sub)  # stabilize skew
+        # Transform for regression
         x = d_sub.astype(np.float32)
+        y = np.log1p(p_sub).astype(np.float32)
 
-        # Ensure finite + enough unique x
         finite = np.isfinite(x) & np.isfinite(y)
         x = x[finite]
         y = y[finite]
         n = x.size
         uniq_x = np.unique(x).size
-
         if n < 10 or uniq_x < 3:
-            print(f"[continuous] [WARN] {class_name}/{band}: too few points (n={n}, unique_x={uniq_x}); skipping")
+            print(
+                f"[continuous] [WARN] {class_name}/{band} ({space}): too few points "
+                f"(n={n}, unique_x={uniq_x}); skipping"
+            )
             continue
 
-        # Pick a safe spline df based on data
-        df_spline = int(min(6, max(4, uniq_x - 1, 3)))
-        df_spline = min(df_spline, n - 2)
-
-        # Fit both models (robust linear + spline OLS)
+        # Robust + OLS linear (no spline)
         lin = _fit_linear_huber(x, y)
-        spl = _fit_spline_ols(x, y, df=df_spline, degree=3)
 
-        # Density heatmap (distance × log-power)
+        # Plot: distance-density and linear line
         xmax = np.percentile(x, 99.5)
         xbins = np.linspace(0, xmax, 100)
         y_lo, y_hi = np.percentile(y, [1, 99])
@@ -981,45 +1061,35 @@ def analyze_continuous(
         )
         ax.set_xlabel("Distance to vessel (mm)")
         ax.set_ylabel("log1p(Band power)")
-        ax.set_title(f"{sp.sub} – {class_name}, band = {band}")
+        ax.set_title(f"{sp.sub} – {class_name}, band = {band} ({space})")
         ax.set_xlim(xedges[0], xedges[-1])
         ax.set_ylim(yedges[0], yedges[-1])
 
-        # Prediction grid for overlays
+        # Linear overlay
         x_line = np.linspace(x.min(), x.max(), 300)
-
-        # Linear line
         X_line_lin = sm.add_constant(x_line)
         y_lin = lin["ols"].predict(X_line_lin)
-
-        # Spline line
-        Xg_spl = dmatrix(
-            f"bs(x, df={df_spline}, degree=3, include_intercept=True)",
-            {"x": x_line},
-            return_type="dataframe",
-        )
-        y_spl = spl["ols"].predict(Xg_spl)
-
         ax.plot(x_line, y_lin, lw=2, label="Linear")
-        ax.plot(x_line, y_spl, lw=2, ls="--", label=f"Spline (df={df_spline})")
 
         # Optional reference overlay
         if ref_curve is not None:
             y_ref = ref_curve(x_line)
-            ax.plot(x_line, y_ref, color="k", ls="--", lw=1.5, label=ref_label)
+            ax.plot(
+                x_line, y_ref, color="k", ls="--", lw=1.5, label=ref_label
+            )
+
         ax.legend()
 
-        # Save figure
         fig_path = (
             sp.figures_dir
-            / f"{sp.sub}_space-MREG_class-{class_name}_band-{band}-desc-continuous.png"
+            / f"{sp.sub}_space-{space}_class-{class_name}_band-{band}-desc-continuous.png"
         )
         fig.tight_layout()
         fig.savefig(fig_path, dpi=150)
         print(f"[continuous] Saved → {fig_path}")
         plt.close(fig)
 
-        # Record stats (linear OLS)
+        # Record stats (linear)
         r_corr = linregress(x, y).rvalue
         stats_rows.append(
             [
@@ -1032,7 +1102,6 @@ def analyze_continuous(
                 int(N),
             ]
         )
-
         result_dict["per_band"][band] = {
             "beta": lin["slope"],
             "se": lin["stderr"],
@@ -1041,7 +1110,6 @@ def analyze_continuous(
             "n": int(N),
         }
 
-    # Write CSV (semicolon for EU Excel)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     with open(out_csv, "w", newline="") as f:
         writer = csv.writer(f, delimiter=";")
@@ -1055,6 +1123,7 @@ def analyze_continuous(
 # -------------------------------------------------------------
 # Radii estimation / fitting / QC
 # -------------------------------------------------------------
+
 def analyze_radius_vs_power(
     sp: SubjectPaths,
     klass: str,
@@ -1065,163 +1134,214 @@ def analyze_radius_vs_power(
     max_points_plot: int = 200_000,
     atol: float = ATOL_DEFAULT,
     mask_threshold: float = MASK_THR_DEFAULT,
+    *,
+    # NEW: let caller point to a radii file or choose its space
+    radii_path: Path | None = None,
+    radii_space: str = "MREG",   # keeps old default behavior
 ):
     """
-    Regress log1p(band power) ~ radius_mm at centerline voxels in MREG space.
+    Regress log1p(band power) on radius (mm) at centerline voxels.
+
+    This function samples bandpower maps at voxels with valid radii on the grid
+    defined by a radius map (MREG or MNI), fits linear models
+    `log1p(band power) ~ radius_mm` per band, and writes a CSV summary and a
+    multi-panel figure (one panel per band).
 
     Parameters
     ----------
     sp : SubjectPaths
-        Must provide `radii_dir`, `bandmaps_dir`, `stats_dir`, `figures_dir`.
+        Subject-scoped paths and identifiers (e.g., `radii_dir`, `bandmaps_dir`,
+        `stats_dir`, `figures_dir`, `sub`).
     klass : {'arteries', 'veins', 'pvs'}
-        Vascular class token used in output filenames.
+        Vascular class token used in filenames and log messages.
     bands : dict
-        Mapping `{band_name: (fmin, fmax)}`; iteration order defines plots.
-    band_paths : dict[str, Path] | None
-        Optional mapping of band name to NIfTI path; otherwise discovered.
-    mask_path : Path | None
-        Optional brain mask to confine analysis; snapped (nearest) if needed.
-    overwrite : bool, default False
-        If False, skip when figure/CSV exist (not enforced here).
-    max_points_plot : int, default 200_000
-        Downsample cap for scatter plotting.
-    atol : float, default 1e-3
-        Absolute tolerance for affine equality when aligning the optional brain
-        mask (and any bandmap resampling) to the radii grid.
-    mask_threshold : float, default 0.5
-        Threshold applied to the (possibly resampled) brain mask; values >
-        mask_threshold are treated as inside brain.
+        Mapping from band name to band definition (e.g., `(fmin, fmax)` in Hz).
+        Only the keys are used here; they must match the band map filenames and
+        any provided `band_paths`.
+    band_paths : dict[str, pathlib.Path] or None, optional
+        Optional explicit mapping from band name to band map path. When not
+        provided for a given band, a canonical filename is constructed as
+        `sub-<ID>_space-<SPACE>_band-<BAND>_desc-power_map.nii.gz` in
+        `sp.bandmaps_dir`, where `<SPACE>` is `radii_space`.
+    mask_path : pathlib.Path or None, optional
+        Optional brain mask NIfTI. If provided, the mask is resampled (nearest)
+        onto the radii grid when shape/affine mismatch exceeds `atol`, and only
+        voxels inside the mask are included in the analysis.
+    overwrite : bool, optional
+        If False (default) and both the CSV and figure already exist, the
+        function skips computation and returns the existing paths.
+    max_points_plot : int, optional
+        Maximum number of points used for scatter plotting per band. If more
+        valid voxels are present, a random subset of size `max_points_plot` is
+        drawn for visualization; regression is always performed on all points.
+    atol : float, optional
+        Absolute tolerance for affine equality when checking alignment between
+        the brain mask and radii grid, and between band maps and radii grid.
+    mask_threshold : float, optional
+        Threshold applied to the (possibly resampled) mask; values strictly
+        greater than `mask_threshold` are treated as in-brain (`True`).
+    radii_path : pathlib.Path or None, optional
+        Optional explicit path to a radius map NIfTI. If None, a canonical
+        filename is constructed as
+        `sub-<ID>_space-<radii_space>_class-<klass>_desc-radius_map.nii.gz`
+        under `sp.radii_dir`.
+    radii_space : str, optional
+        Space tag for the radii map and derived outputs (e.g., `"MREG"` or
+        `"MNI"`). When `radii_path` is provided, `radii_space` is updated by
+        `_infer_space_from_path` if a space token can be inferred from the
+        filename. Default is `"MREG"` (legacy behavior).
 
     Returns
     -------
-    (Path | None, Path | None)
-        `(csv_path, fig_path)` if successful, else `None`.
+    tuple[pathlib.Path, pathlib.Path] or None
+        `(csv_path, fig_path)` if analysis is performed or existing outputs are
+        found; None if radii are missing or no valid in-brain radii are
+        available.
 
     Files written
     -------------
     - stats/
-      `sub-<ID>_space-MREG_class-<klass>_desc-radius_vs_power.csv` (semicolon CSV)
+      `sub-<ID>_space-<SPACE>_class-<klass>_desc-radius_vs_power.csv`
+      (semicolon-delimited with columns:
+      `band;n;slope;intercept;p_value;r_value;r_squared;spearman_r;spearman_p;mean_radius_mm`)
     - figures/
-      `sub-<ID>_space-MREG_class-<klass>_desc-radius_vs_power.png`
+      `sub-<ID>_space-<SPACE>_class-<klass>_desc-radius_vs_power.png`
+      (one scatter + regression curve per band, panels arranged horizontally)
 
     Assumptions / Preconditions
     ---------------------------
-    - Radii map exists at:
-      `radii/sub-<ID>_space-MREG_class-<klass>_desc-radius_map.nii.gz`.
-    - Centerline voxels have `radius > 0`; failed fits marked ≤0 downstream.
+    - Radii map:
+      - Defined on a single 3D grid (MREG or MNI) with affine `ref_aff` and
+        shape `ref_shape`.
+      - Encodes radius in millimeters; valid centerline voxels have `rad > 0`
+        and failed fits are ≤ 0 (typically -1).
+    - Band maps:
+      - Stored as float NIfTIs in the same space as `radii_space` or
+        resample-able to that grid; amplitude units are arbitrary (a.u.).
+      - One band map per key in `bands`.
+    - Mask:
+      - If provided, is a brain mask (0/1-like) that can be resampled to the
+        radii grid via nearest-neighbor interpolation.
 
     Warnings
     --------
-    - Affine/shape mismatches are corrected for band maps via resampling
-      (linear, order=1) to the radii grid solely for plotting/regression.
-    - Brain mask thresholding uses `mask_threshold`; resampling/snap decisions
-      use `atol`. Band maps are resampled (linear) only when needed for grid match.
+    - Band maps that do not align with the radii grid within `atol` are
+      resampled with **linear** interpolation (order=1), which may slightly
+      smooth values.
+    - The brain mask, when provided, is resampled with **nearest-neighbor**
+      interpolation to preserve binary labels.
+    - At least 10 valid samples are required per band; bands with fewer valid
+      points are skipped.
+    - The CSV uses a semicolon delimiter for spreadsheet compatibility.
+
+    Notes
+    -----
+    - Linear regressions are performed on `(radius_mm, log1p(band power))`,
+      but the scatter plots and regression curves are displayed in raw band
+      power units on the y-axis.
+    - Pearson statistics (slope, intercept, r, p, stderr) are computed via
+      `scipy.stats.linregress`, while Spearman rank correlation is computed
+      on `(radius_mm, band power)` using `scipy.stats.spearmanr`.
     """
-    # paths
-    rad_path = Path(sp.radii_dir) / deriv_name(sp.sub, "MREG", klass, "radius", "map")
+    # --- resolve radii path & space ---
+    if radii_path is None:
+        rad_path = Path(sp.radii_dir) / deriv_name(sp.sub, radii_space, klass, "radius", "map")
+    else:
+        rad_path = Path(radii_path)
+        # infer space tag from filename if possible
+        radii_space = _infer_space_from_path(rad_path, default=radii_space)
+
     if not rad_path.exists():
-        print(f"[radius] [SKIP] No MREG radii for {klass}: {rad_path.name}")
+        print(f"[radius] [SKIP] No radii for {klass} in {radii_space}: {rad_path.name}")
         return None
 
-    # load radii & ref
+    # --- output targets (space-tagged) ---
+    csv_path = Path(sp.stats_dir)   / f"{sp.sub}_space-{radii_space}_class-{klass}_desc-radius_vs_power.csv"
+    fig_path = Path(sp.figures_dir) / f"{sp.sub}_space-{radii_space}_class-{klass}_desc-radius_vs_power.png"
+
+    if csv_path.exists() and fig_path.exists() and not overwrite:
+        print(f"[radius] [SKIP] Exists (CSV+FIG) for {klass} in {radii_space}: {csv_path.name}, {fig_path.name}")
+        return csv_path, fig_path
+
+    # --- load radii ---
     rad_img = nib.load(str(rad_path))
     rad = np.asarray(rad_img.get_fdata(), dtype=np.float32)
     ref_shape, ref_aff = rad_img.shape, rad_img.affine
 
-    # brain mask (optional)
+    # --- optional brain mask (snap to radii grid) ---
     brain = None
     if mask_path is not None and Path(mask_path).exists():
         m = nib.load(str(mask_path))
-        if m.shape != ref_shape or not np.allclose(m.affine, ref_aff, atol=atol):
+        if (m.shape != ref_shape) or (not np.allclose(m.affine, ref_aff, atol=atol)):
             m = resample_from_to(m, (ref_shape, ref_aff), order=0)
-        brain = (m.get_fdata() > float(mask_threshold)).astype(bool) # brain = m.get_fdata().astype(bool)
+        brain = (m.get_fdata() > float(mask_threshold)).astype(bool)
 
-    # centerline voxels with valid radii
+    # --- valid centerline points ---
     valid = rad > 0
     if brain is not None:
         valid &= brain
     if not np.any(valid):
-        print(f"[radius] [SKIP] No valid in-brain radii for {klass}")
+        print(f"[radius] [SKIP] No valid in-brain radii for {klass} in {radii_space}")
         return None
 
-    # Prepare output CSV rows
-    rows = [
-        (
-            "band",
-            "n",
-            "slope",
-            "intercept",
-            "p_value",
-            "r_value",
-            "r_squared",
-            "spearman_r",
-            "spearman_p",
-            "mean_radius_mm",
-        )
-    ]
-    fig, axs = plt.subplots(1, len(bands), figsize=(4.2 * len(bands), 4.0), squeeze=False)
-    axs = axs[0]
-
-    # gather indices once (for faster sampling)
     ii, jj, kk = np.where(valid)
     radii_vec = rad[ii, jj, kk]
 
+    # --- set up plotting ---
+    rows = [("band","n","slope","intercept","p_value","r_value","r_squared",
+             "spearman_r","spearman_p","mean_radius_mm")]
+    fig, axs = plt.subplots(1, len(bands), figsize=(4.2 * len(bands), 4.0), squeeze=False)
+    axs = axs[0]
+
+    # --- loop bands ---
     for bidx, (band_name, _) in enumerate(bands.items()):
-        # locate band map
+        # 1) resolve band map (prefer explicit, else discover space-matched)
         if band_paths and band_name in band_paths:
             bpath = Path(band_paths[band_name])
         else:
-            # fallback: look for a file that contains band name in desc
-            cand = list(
-                Path(sp.bandmaps_dir).glob(
-                    f"{sp.sub}_space-MREG_*desc*{band_name}*_map.nii.gz"
-                )
-            )
-            if not cand:
-                print(f"[radius] [SKIP] Band '{band_name}' map not found")
-                continue
-            bpath = cand[0]
+            # canonical name:
+            candidate = Path(sp.bandmaps_dir) / f"{sp.sub}_space-{radii_space}_band-{band_name}_desc-power_map.nii.gz"
+            if candidate.exists():
+                bpath = candidate
+            else:
+                # fallback glob (more permissive)
+                hits = list(Path(sp.bandmaps_dir).glob(
+                    f"{sp.sub}_space-{radii_space}_*{band_name}*power_map.nii.gz"))
+                if not hits:
+                    print(f"[radius] [SKIP] Band '{band_name}' map not found in space {radii_space}")
+                    continue
+                bpath = hits[0]
 
         bimg = nib.load(str(bpath))
         bdat = np.asarray(bimg.get_fdata(), dtype=np.float32)
 
-        # align band map to radii grid if needed
-        if bimg.shape != ref_shape or not np.allclose(bimg.affine, ref_aff, atol=1e-3):
+        # 2) align band map to radii grid
+        if (bimg.shape != ref_shape) or (not np.allclose(bimg.affine, ref_aff, atol=atol)):
             bimg = resample_from_to(bimg, (ref_shape, ref_aff), order=1)
             bdat = np.asarray(bimg.get_fdata(), dtype=np.float32)
 
-        # sample band values at centerline voxels
+        # 3) sample band values at centerline
         power_vec = bdat[ii, jj, kk]
-        # mask out NaNs from brain-masked bandmaps
         good = np.isfinite(power_vec)
         x = radii_vec[good]
         y = power_vec[good]
         n = x.size
         if n < 10:
-            print(f"[radius] [SKIP] Too few points for {band_name} ({n})")
+            print(f"[radius] [SKIP] Too few points for {band_name} ({n}) in {radii_space}")
             continue
 
-        # regression on log1p(power)
+        # 4) regression (log1p power); Spearman on raw (keep as before)
         y_log = np.log1p(y)
         lr = linregress(x, y_log)  # slope, intercept, rvalue, pvalue, stderr
         spearman_r, spearman_p = spearmanr(x, y, nan_policy="omit")
 
-        rows.append(
-            (
-                band_name,
-                int(n),
-                float(lr.slope),
-                float(lr.intercept),
-                float(lr.pvalue),
-                float(lr.rvalue),
-                float(lr.rvalue**2),
-                float(spearman_r),
-                float(spearman_p),
-                float(np.mean(x)),
-            )
-        )
+        rows.append((
+            band_name, int(n), float(lr.slope), float(lr.intercept),
+            float(lr.pvalue), float(lr.rvalue), float(lr.rvalue**2),
+            float(spearman_r), float(spearman_p), float(np.mean(x))
+        ))
 
-        # plot (downsample for speed)
+        # 5) plot
         ax = axs[bidx]
         if n > max_points_plot:
             sel = np.random.default_rng(0).choice(n, size=max_points_plot, replace=False)
@@ -1229,7 +1349,6 @@ def analyze_radius_vs_power(
         else:
             xx, yy = x, y
         ax.scatter(xx, yy, s=2, alpha=0.3)
-        # trendline in original power units (exp of log fit minus 1)
         xs = np.linspace(xx.min(), xx.max(), 200)
         ys = np.exp(lr.intercept + lr.slope * xs) - 1.0
         ax.plot(xs, ys, linewidth=2)
@@ -1237,52 +1356,67 @@ def analyze_radius_vs_power(
         ax.set_xlabel("Radius (mm)")
         ax.set_ylabel("Band power")
 
-    # save CSV + figure
-    csv_path = (
-        Path(sp.stats_dir)
-        / f"{sp.sub}_space-MREG_class-{klass}_desc-radius_vs_power.csv"
-    )
-    fig_path = (
-        Path(sp.figures_dir)
-        / f"{sp.sub}_space-MREG_class-{klass}_desc-radius_vs_power.png"
-    )
+    # --- write outputs (respect overwrite) ---
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     fig_path.parent.mkdir(parents=True, exist_ok=True)
-    # write semicolon CSV (standardized)
+
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f, delimiter=";")
         for r in rows:
             w.writerow(r)
-    print(f"[radius] Saved → {fig_path}")
     fig.tight_layout()
     fig.savefig(fig_path, dpi=180)
-    print(f"[radius] Saved → {fig_path}")
     plt.close(fig)
 
+    print(f"[radius] Saved CSV → {csv_path}")
+    print(f"[radius] Saved FIG → {fig_path}")
     return csv_path, fig_path
 
 
-# -------------------------------------------------------------
-# Utilities (model fitting)
-# -------------------------------------------------------------
 def _fit_linear_huber(x, y):
     """
-    Robust + OLS linear model: `y ~ x`.
+    Fit a robust and OLS linear model `y ~ x` and return summary stats.
+
+    A Huber regressor is used to obtain a robust line for visualization,
+    while an ordinary least squares (OLS) model provides inferential
+    quantities such as p-values, standard errors, and AIC.
 
     Parameters
     ----------
-    x, y : ndarray, shape (n,), dtype=float32/float64
-        Finite vectors after preprocessing.
+    x : ndarray, shape (n,)
+        Predictor values (e.g., distance or radius), finite after any
+        preprocessing.
+    y : ndarray, shape (n,)
+        Response values (e.g., log1p(band power)), finite after any
+        preprocessing.
 
     Returns
     -------
     dict
-        Keys: `type`, `slope`, `intercept`, `stderr`, `p`, `r2`, `aic`,
-        `ols` (statsmodels fit), and `yhat` (Huber predictions).
+        Dictionary with keys:
+        - ``type`` : str
+            Model type (always ``"linear"``).
+        - ``slope`` : float
+            OLS slope coefficient.
+        - ``intercept`` : float
+            OLS intercept.
+        - ``stderr`` : float
+            Standard error of the slope (OLS).
+        - ``p`` : float
+            Two-sided p-value for the slope (OLS).
+        - ``r2`` : float
+            Coefficient of determination (R²) from OLS.
+        - ``aic`` : float
+            Akaike Information Criterion for the OLS fit.
+        - ``ols`` : statsmodels.regression.linear_model.RegressionResults
+            The fitted OLS model object.
+        - ``yhat`` : ndarray, shape (n,)
+            Robust-predicted values from the Huber regressor.
 
     Notes
     -----
-    - Huber regression stabilizes against outliers; OLS provides inference.
+    - No intercept centering is applied beyond the implicit constant term in
+      the OLS design matrix (`sm.add_constant`).
     """
     # robust fit for line
     huber = HuberRegressor().fit(x.reshape(-1, 1), y)
@@ -1301,39 +1435,4 @@ def _fit_linear_huber(x, y):
         "aic": float(ols.aic),
         "ols": ols,  # keep for CI/prediction on a grid
         "yhat": yhat_rl,  # robust-predicted (visual line is stable)
-    }
-
-
-def _fit_spline_ols(x, y, df: float, degree=3):
-    """
-    Cubic regression spline OLS via patsy basis (`bs`).
-
-    Parameters
-    ----------
-    x, y : ndarray, shape (n,), dtype=float32/float64
-        Finite vectors after preprocessing.
-    df : float
-        Approximate degrees of freedom for the spline basis.
-    degree : int, default 3
-        Polynomial degree for each spline segment.
-
-    Returns
-    -------
-    dict
-        Keys: `type`, `df`, `degree`, `aic`, `r2`, `ols`, `X_design`.
-    """
-    Xs = dmatrix(
-        f"bs(x, df={df}, degree={degree}, include_intercept=True)",
-        {"x": x},
-        return_type="dataframe",
-    )
-    ols = sm.OLS(y, Xs).fit()
-    return {
-        "type": "spline",
-        "df": df,
-        "degree": degree,
-        "aic": float(ols.aic),
-        "r2": float(ols.rsquared),
-        "ols": ols,  # for CI/prediction
-        "X_design": Xs,  # cache (optional)
     }

@@ -2,66 +2,71 @@
 """
 distance.py
 -----------
-Distance-map generation on the MREG grid for downstream distance-clustered
+Distance-map generation in MNI space for downstream distance-clustered
 spectral analysis.
 
-This module standardizes computation of Euclidean distance transforms (EDT) in
-millimeters from class masks (e.g., arteries) anchored to a 3D MREG reference
-image. Masks are snapped with **nearest-neighbor** resampling to the MREG grid
-(labels preserved). Outputs are float32 NIfTI files with the reference affine.
-
-New in this version
--------------------
-In addition to computing the EDT after snapping a mask to the MREG grid, this
-module can compute the EDT in the **native mask space** and then compose a
-single affine (native→T1→MREG) to resample **once** onto the MREG grid using
-linear interpolation (float). This avoids two resamples and preserves native
-voxel geometry for the distance computation.
+This module standardizes computation of Euclidean distance transforms (EDT)
+in millimeters from class masks (e.g., arteries, veins, perivascular spaces)
+after warping them into a common MNI reference space via `TransformBook`.
+Masks are warped with nearest-neighbor interpolation (labels preserved),
+and the EDT is computed on the MNI grid using voxel sizes from the MNI
+header. Outputs are float32 NIfTI files in MNI space used by cluster and
+continuous proximity analyses.
 
 Pipeline steps
 --------------
-1. Resolve an MREG reference image (meanamp → mean → ref → fallback picker).
-2. Snap class masks to the reference grid (nearest-neighbor, labels).
-   2a. Alternatively: compute EDT in native space and resample once to MREG
-       through the composed (native→T1→MREG) affine.
-3. Compute Euclidean distance transform in **mm** using header zooms.
-4. Optionally confine distances to an MREG brain mask (set outside to NaN).
+1. Resolve native-space masks per class via `SubjectPaths` and `deriv_name`.
+2. Warp each native mask to MNI with nearest-neighbor interpolation
+   (chain: native space → T1 → MNI), and save the warped MNI mask for
+   QC/reuse.
+3. Compute the Euclidean distance transform (EDT) in MNI space using the
+   first three header zooms (assumed to be in mm).
+4. Save distance maps as float32 NIfTI images in the subject-level
+   `distmaps/` directory in MNI space.
 
 Inputs / Outputs
 ----------------
-Inputs  : Class masks in (ideally) MREG space; optionally native-space masks
-          plus transforms; an optional brain mask in MREG space; SubjectPaths
-          for BIDS-derivatives roots and references.
-Outputs : Distance maps saved as float32 NIfTI images on the MREG grid.
+Inputs
+    - Native-space binary masks for each class (arteries/veins/pvs) under
+      `derivatives/neurofluid-mreg/sub-<ID>/masks/`.
+    - A `TransformBook` instance providing native→T1 and T1→MNI transforms
+      and an MNI reference image.
+    - A `SubjectPaths` instance for naming and directory conventions.
+Outputs
+    - Per-class distance maps on the MNI grid as float32 NIfTI images.
 
 Files written
 -------------
 - derivatives/neurofluid-mreg/sub-<ID>/distmaps/
-  sub-<ID>_space-MREG_class-<CLASS>_desc-dist_map.nii.gz
+  sub-<ID>_space-MNI_class-<CLASS>_desc-dist_map.nii.gz
 
 Assumptions / Preconditions
 ---------------------------
-- Spaces: Operates in **MREG** space. If a source mask is not on the MREG grid,
-  it is resampled with **nearest-neighbor** to the reference image, or the EDT
-  is computed in native space and resampled once to MREG if transforms are
-  provided.
-- Affines: If affines differ, continue in image space after snapping to the
-  reference (no smoothing; labels preserved) unless the native-first route is
-  taken (linear interpolation, one resample).
-- Shapes/dtypes: Output `float32`, shape equals MREG reference shape.
-- BIDS naming: `sub-<ID>_space-<SPACE>_class-<CLASS>_desc-<DESC>_<SUFFIX>.nii.gz`.
+- Spaces: Operates in **MNI** space. Native-space masks (TOF/MRV/hT2w) are
+  warped to MNI before computing the EDT. No distance maps are computed
+  directly on the MREG grid in this module.
+- Affines: The MNI reference affine encodes voxel sizes (assumed mm). EDT
+  uses the first three header zooms; downstream interpretation assumes,
+  but does not enforce, millimeter units.
+- Shapes/dtypes: Output images have shape equal to the MNI reference, with
+  dtype float32. Warped masks are stored as uint8.
+- BIDS naming: Distance maps use the pattern
+  `sub-<ID>_space-MNI_class-<CLASS>_desc-dist_map.nii.gz`.
 
 Warnings
 --------
-- Nearest-neighbor snapping may introduce staircase effects at label borders.
-- If a brain mask is provided, voxels outside are set to **NaN** (ignored by
-  downstream statistics); consumers must handle NaNs explicitly.
-- Distance outside the mask is distance to the nearest mask voxel (standard EDT).
+- If a required transform (e.g., `mrv_to_t1`) is missing, the corresponding
+  class distance map is skipped and `None` may be returned for that class.
+- Units of the distance map are inferred from header zooms and treated as
+  millimeters; verify that the MNI reference uses mm (standard in NIfTI)
+  when interpreting slopes or effect sizes.
+- This module does not currently support an external brain mask; all
+  voxels in the MNI field of view are included in the EDT.
 
 Public API
 ----------
-- distance_map
-- generate_distance_maps
+- distance_map_native_to_mni
+- generate_distance_maps_mni
 """
 
 from __future__ import annotations
@@ -69,9 +74,7 @@ from pathlib import Path
 import nibabel as nib, numpy as np
 from scipy.ndimage import distance_transform_edt
 from .io import deriv_name
-from nibabel.processing import resample_from_to
-from .mreg import _pick_mreg_ref_path
-from .transforms import apply_affine_to_ref
+from .transforms import TransformBook
 
 # Which native space + transform key to use per class
 _CLASS_TO_NATIVE = {
@@ -79,405 +82,265 @@ _CLASS_TO_NATIVE = {
     "veins": ("MRV", "mrv_to_t1"),
     "pvs": ("HT2W", "ht2w_to_t1"),
 }
-# Policy: compute EDT on the analysis grid (MREG). Do NOT resample distance maps.
-NATIVE_FIRST_ALLOWED = False  # set True only for quick QC, not for analysis
-
-
-
-# -------------------------------------------------------------
-# I/O helpers (BIDS naming, paths)
-# -------------------------------------------------------------
-def _get_mreg_ref_img(sp):
-    """
-    Resolve a 3D MREG reference image for anchoring outputs.
-
-    Preference order
-    ----------------
-    1) `sp.mreg_meanamp_path`
-    2) `sp.mreg_mean_path`
-    3) `sp.mreg_ref_path`
-    4) Fallback: `_pick_mreg_ref_path(sp)` from `.mreg`
-
-    Returns
-    -------
-    nib.Nifti1Image
-        Reference image whose shape and affine define the MREG grid.
-
-    Assumptions / Preconditions
-    ---------------------------
-    - Attributes (if present) contain valid NIfTI paths.
-    - First existing path in the preference order is used.
-
-    Warnings
-    --------
-    - No validation of image content beyond successful load.
-    """
-    for attr in ("mreg_meanamp_path", "mreg_mean_path", "mreg_ref_path"):
-        p = getattr(sp, attr, None)
-        if p and Path(p).exists():
-            return nib.load(str(p))
-    return nib.load(str(_pick_mreg_ref_path(sp)))
-
 
 # -------------------------------------------------------------
 # Registration / native-space transforms
 # -------------------------------------------------------------
-def _distance_map_native_to_mreg(
-    sp,
-    xfm,
-    native_mask_path: Path,
-    native_to_t1_key: str,
-    out_path: Path,
-) -> Path:
-    """
-    Compute EDT in the native mask grid and resample once to MREG.
-
-    The native→MREG mapping is formed by composing the provided transforms
-    (native→T1 and T1→MREG). The native-space float distance map is then
-    resampled to the MREG grid in a single step using linear interpolation.
-
-    Parameters
-    ----------
-    sp : SubjectPaths
-        Subject structure providing access to MREG references and output roots.
-    xfm : Mapping[str, str] or dict
-        Lookup table from transform key to text file path of a 4×4 affine.
-        Must at least contain:
-        - `native_to_t1_key` (passed here)
-        - `'t1_to_mreg'`
-    native_mask_path : Path
-        Path to a binary native-space mask NIfTI.
-    native_to_t1_key : str
-        Key within `xfm` for the native→T1 4×4 affine (text file).
-    out_path : Path
-        Destination path for the MREG-space distance map (float32).
-
-    Returns
-    -------
-    Path
-        Saved distance map path (float32, MREG grid).
-
-    Files written
-    -------------
-    - `<out_path>` : final distance map (float32).
-    - Temporary files with prefixes `tmp_native_dist_` and `_ref_mreg_` are
-      created next to `<out_path>` and removed at the end.
-
-    Assumptions / Preconditions
-    ---------------------------
-    - Transform files pointed to by `xfm[...]` are readable 4×4 matrices in
-      text format (`np.loadtxt`).
-    - Native mask is binary or thresholdable to boolean; header zooms encode mm.
-    - The MREG reference header/affine define the target grid.
-
-    Warnings
-    --------
-    - Linear interpolation of distances may slightly reduce sharp peaks.
-    - Numerical round-off may yield tiny negative values; these are clamped to
-      0.0 before saving.
-    - Accuracy depends on the correctness of the provided affines and headers.
-
-    Raises
-    ------
-    FileNotFoundError
-        If the native mask or any required transform file cannot be loaded.
-    ValueError
-        If a transform file does not contain a valid 4×4 affine.
-    RuntimeError
-        If resampling through `apply_affine_to_ref` fails.
-
-    Notes
-    -----
-    - EDT is computed in native space using native voxel sizes (mm). A single
-      resample to MREG avoids stacking resampling errors.
-    """
-
-    # 1) EDT in native (preserves mm units via native zooms)
-    mask_img = nib.load(str(native_mask_path))
-    mask = mask_img.get_fdata() > 0.5
-    zooms = mask_img.header.get_zooms()[:3]
-    dist_native = distance_transform_edt(~mask, sampling=zooms).astype(np.float32)
-
-    # Persist a tiny temp NIfTI in the same folder (so apply_affine_to_ref can
-    # read paths)
-    tmp_native = out_path.parent / ("tmp_native_dist_" + out_path.name)
-    nib.save(
-        nib.Nifti1Image(dist_native, mask_img.affine, mask_img.header),
-        str(tmp_native),
-    )
-
-    # 2) Compose native→MREG = (T1→MREG) · (native→T1)
-    A_native_to_t1 = np.loadtxt(xfm.get(native_to_t1_key))
-    A_t1_to_mreg = np.loadtxt(xfm.get("t1_to_mreg"))
-    A_native_to_mreg = A_t1_to_mreg @ A_native_to_t1
-    print("[dist] native→MREG composed (T1→MREG · native→T1)")
-
-    # 3) One-shot resample to MREG grid (linear for float distances)
-    mreg_ref_img = _get_mreg_ref_img(sp)
-    mreg_ref_path = out_path.parent / ("_ref_mreg_" + out_path.name)  # tiny stub path
-    nib.save(
-        nib.Nifti1Image(
-            np.zeros(mreg_ref_img.shape, dtype=np.float32),
-            mreg_ref_img.affine,
-            mreg_ref_img.header,
-        ),
-        str(mreg_ref_path),
-    )
-    apply_affine_to_ref(
-        image_path=tmp_native,
-        affine=A_native_to_mreg,
-        ref_img_path=mreg_ref_path,
-        out_path=out_path,
-        interpolation="linear",
-    )
-
-    # Cleanup temp files
-    try:
-        tmp_native.unlink(missing_ok=True)
-        mreg_ref_path.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-    # 4) Clamp tiny negatives (numerical) to 0
-    out_img = nib.load(str(out_path))
-    arr = np.asarray(out_img.get_fdata(), dtype=np.float32)
-    arr[arr < 0] = 0.0
-    nib.save(nib.Nifti1Image(arr, out_img.affine, out_img.header), str(out_path))
-    print(f"[dist] Saved → {out_path}")
-    return out_path
 
 
-# -------------------------------------------------------------
-# Thresholding / post-processing / skeletonization
-# (Distance-map computation and writing)
-# -------------------------------------------------------------
-def distance_map(
-    sp,
-    mask_path: Path,
-    out_path: Path,
+def distance_map_native_to_mni(
     *,
-    xfm=None,  # deprecated; ignored
-    native_to_t1_key: str | None = None,  # deprecated; ignored
-) -> Path:
+    sp,
+    xfm: TransformBook,
+    klass: str,
+    native_mask_path: Path,
+    out_mni_path: Path,
+    overwrite: bool = False,
+    mask_threshold: float = 0.5,
+) -> Path | None:
     """
-    Compute a Euclidean distance transform (EDT, mm) and save on the MREG grid.
+    Compute the Euclidean distance transform (mm) in MNI space from a native mask.
 
-    If `xfm` and `native_to_t1_key` are provided and the input mask is **not**
-    on the MREG grid, the EDT is computed in the mask's native space and then
-    resampled **once** to the MREG grid through the composed (native→T1→MREG)
-    affine using linear interpolation. Otherwise, the mask is snapped to MREG
-    with nearest-neighbor and EDT is computed on the MREG grid.
+    The native binary mask is first warped to MNI space using nearest-neighbor
+    interpolation via `TransformBook.warp_labels`, then hard-binarized, and
+    finally an EDT is computed on the MNI grid using voxel sizes from the MNI
+    header. The result is saved as a float32 NIfTI file with the MNI affine.
 
     Parameters
     ----------
     sp : SubjectPaths
-        Provides access to optional MREG reference paths and output roots.
-    mask_path : Path
-        Path to a binary mask NIfTI. If its grid/affine differ from the MREG
-        reference, it is snapped with **nearest-neighbor** unless transforms
-        are provided (native-first route).
-    out_path : Path
-        Destination path for the distance map NIfTI.
-    xfm : Any, deprecated
-        Ignored. The previous "native-first EDT then resample once" route has
-        been removed in favor of "register-to-MREG then EDT".
-    native_to_t1_key : str or None, deprecated
-        Ignored; see `xfm`.
+        Subject-specific paths and derivative directories, used to locate and
+        name the MNI-space mask.
+    xfm : TransformBook
+        Transform registry providing native→T1 and T1→MNI chains. Must expose
+        `mni_ref_path` and support `warp_labels(...)` with a chain that maps
+        from the class native space to MNI.
+    klass : {'arteries', 'veins', 'pvs'}
+        Class label, used to look up the native-space key and to construct
+        derivative filenames.
+    native_mask_path : Path
+        Path to the native-space binary mask NIfTI image for the class. Values
+        are interpreted as foreground if greater than `mask_threshold`.
+    out_mni_path : Path
+        Destination path for the MNI-space float32 distance map NIfTI image.
+    overwrite : bool, default=False
+        If False and `out_mni_path` already exists, computation is skipped and
+        the existing path is returned.
+    mask_threshold : float, default=0.5
+        Threshold applied after warping to MNI to re-binarize the mask. Values
+        strictly greater than this threshold are treated as foreground.
 
     Returns
     -------
-    Path
-        Saved distance map path (float32, MREG grid).
+    Path or None
+        `out_mni_path` on success. Returns None if a required transform is
+        missing (e.g., missing affine for the given native space), in which
+        case the corresponding class is skipped.
 
     Files written
     -------------
+    - derivatives/neurofluid-mreg/sub-<ID>/masks/
+      sub-<ID>_space-MNI_class-<CLASS>_desc-main_mask.nii.gz
+      (warped, binarized MNI mask for QC/reuse)
     - derivatives/neurofluid-mreg/sub-<ID>/distmaps/
-      sub-<ID>_space-MREG_class-<CLASS>_desc-dist_map.nii.gz
+      sub-<ID>_space-MNI_class-<CLASS>_desc-dist_map.nii.gz
+      (float32 Euclidean distance map in mm)
 
     Assumptions / Preconditions
     ---------------------------
-    - Spaces: Operates on/saves to **MREG** space.
-    - If mask and MREG reference mismatch, mask is snapped (nearest-neighbor).
-    - Input mask is binary or thresholdable to boolean.
+    - `xfm.mni_ref_path` points to a valid MNI reference NIfTI image whose
+      header zooms encode voxel sizes in mm.
+    - The native mask is registered to the native space implied by
+      `_CLASS_TO_NATIVE[klass]`.
+    - `native_mask_path` exists and is readable as a NIfTI image.
 
     Warnings
     --------
-    - Nearest-neighbor snapping preserves labels but may alias boundaries.
-    - Small negative values should not occur (no linear resampling of distances).
+    - Units inferred from the MNI header zooms are assumed to be millimeters;
+      verify mm vs voxel indices if using non-standard references.
+    - If a "Missing affine" error arises inside `warp_labels`, the function
+      prints a skip message and returns None; callers should handle this
+      possibility when aggregating results.
 
     Raises
     ------
-    FileNotFoundError
-        If `mask_path` or resolved reference path cannot be loaded.
-
-    Notes
-    -----
-    - Distances are in **millimeters** from the MREG header zooms.
-    - Output dtype is float32; header/affine copied from the MREG reference.
+    RuntimeError
+        If `xfm.mni_ref_path` is not set or if `warp_labels` fails for reasons
+        other than missing affine transforms.
     """
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    native_space, _ = _CLASS_TO_NATIVE[klass]
 
-    ref_img = _get_mreg_ref_img(sp)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_mni_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # If we got transforms AND the mask is not on the MREG grid,
-    # do the native-first route.
-    ref_img = _get_mreg_ref_img(sp)
-    try:
-        src_img = nib.load(str(mask_path))
-    except Exception as e:
-        raise FileNotFoundError(f"Cannot load mask: {mask_path} :: {e}")
+    # --- where the MNI mask belongs (derivatives/masks) ---
+    mni_mask_path = Path(sp.masks_dir) / deriv_name(
+        sp.sub, "MNI", klass, "main", "mask"
+    )
 
-    if NATIVE_FIRST_ALLOWED and (xfm is not None) and (native_to_t1_key is not None) and (
-    src_img.shape != ref_img.shape
-    or not np.allclose(src_img.affine, ref_img.affine, atol=1e-3)):
-        print("[dist] Route: native EDT → one-shot resample to MREG")
-        return _distance_map_native_to_mreg(
-            sp, xfm, mask_path, native_to_t1_key, out_path
+    # Resolve MNI reference for warp_labels
+    if getattr(xfm, "mni_ref_path", None):
+        mni_ref_path = Path(xfm.mni_ref_path)
+        _ = nib.load(str(mni_ref_path))  # ensure readable
+    else:
+        raise RuntimeError(
+            "[dist→mni] xfm.mni_ref_path is required for label warps."
         )
 
-    ref_shape, ref_aff = ref_img.shape, ref_img.affine
+    # 1) Warp native mask → MNI (NEAREST) and SAVE for QC/reuse
+    if (not mni_mask_path.exists()) or overwrite:
+        try:
+            xfm.warp_labels(
+                moving_img=str(native_mask_path),
+                reference_img=str(mni_ref_path),
+                out_path=str(mni_mask_path),
+                chain=(native_space, "MNI"),
+                interpolation="nearest",
+            )
+        except RuntimeError as e:
+            # e.g. Missing affine 'mrv_to_t1' / 'ht2w_to_t1' when MRV/HT2w not present
+            if "Missing affine" in str(e):
+                print(
+                    f"[dist→mni] [SKIP] No transform for {klass} "
+                    f"({native_space}→T1); skipping distance map."
+                )
+                return None
+            raise
+        # hard-binarize to {0,1}
+        _img = nib.load(str(mni_mask_path))
+        _dat = (_img.get_fdata() > float(mask_threshold)).astype(np.uint8)
+        nib.save(
+            nib.Nifti1Image(_dat, _img.affine, _img.header), str(mni_mask_path)
+        )
+        print(f"[dist→mni] Saved warped {klass} mask in MNI → {mni_mask_path}")
+    else:
+        print(
+            f"[dist→mni] [SKIP] MNI {klass} mask exists: {mni_mask_path.name}"
+        )
 
-    # Snap mask to MREG grid (nearest; labels preserved)
-    if src_img.shape != ref_shape or not np.allclose(
-        src_img.affine, ref_aff, atol=1e-3
-    ):
-        src_img = resample_from_to(src_img, (ref_shape, ref_aff), order=0)
-        print("[dist] [WARN] Source mask snapped to MREG grid (nearest)")
+    # 2) If distance map already exists and not overwriting, stop early
+    if out_mni_path.exists() and not overwrite:
+        print(f"[dist→mni] [SKIP] Exists: {out_mni_path.name}")
+        return out_mni_path
 
-    mask = src_img.get_fdata().astype(bool, copy=False)
-    zooms = ref_img.header.get_zooms()[:3]
-    dist = distance_transform_edt(~mask, sampling=zooms).astype(np.float32, copy=False)
+    # 3) EDT on the MNI grid (use MNI voxel sizes)
+    mni_mask_img = nib.load(str(mni_mask_path))
+    mni_mask = mni_mask_img.get_fdata() > float(mask_threshold)
+    zooms = mni_mask_img.header.get_zooms()[:3]
+    dist_mni = distance_transform_edt(~mni_mask, sampling=zooms).astype(
+        np.float32
+    )
 
-    hdr = ref_img.header.copy()
+    hdr = mni_mask_img.header.copy()
     hdr.set_data_dtype(np.float32)
-    nib.save(nib.Nifti1Image(dist, ref_aff, hdr), str(out_path))
-    print(f"[dist] Saved → {out_path}")
-    return out_path
+    nib.save(
+        nib.Nifti1Image(dist_mni, mni_mask_img.affine, hdr), str(out_mni_path)
+    )
+    print(f"[dist→mni] Saved → {out_mni_path}")
+
+    return out_mni_path
 
 
-def generate_distance_maps(
+# -------------------------------------------------------------
+# Distance-map computation and writing (MNI grid)
+# -------------------------------------------------------------
+
+
+def generate_distance_maps_mni(
     sp,
-    classes: tuple[str, ...] = ("arteries",),
-    mask_path: Path | None = None,
+    xfm: TransformBook,
+    classes: tuple[str, ...] = ("arteries", "veins", "pvs"),
+    *,
     overwrite: bool = False,
-    xfm=None,
-) -> None:
+) -> dict[str, Path]:
     """
-    Build class-wise distance maps **on the MREG grid** (EDT computed in MREG).
+    Generate MNI-space distance maps for each vascular class.
 
-    For each vascular class, the mask is ensured to be in MREG space. If an
-    MREG-space mask already exists, it is used directly. If only a native-space
-    mask exists, it is resampled to MREG with nearest-neighbor, and the
-    Euclidean distance transform (EDT) is then computed on the MREG grid.
-    The distance image is never resampled.
+    For each requested class, this function locates the corresponding native
+    mask, warps it to MNI via `distance_map_native_to_mni`, and writes a
+    float32 EDT NIfTI distance map under the subject's `distmaps/` directory.
+    Existing distance maps are reused unless `overwrite` is True.
 
     Parameters
     ----------
     sp : SubjectPaths
-        Provides subject context and directories. Must expose:
-        - `sp.sub` (str), `sp.masks_dir` (Path), `sp.distmaps_dir` (Path)
-    classes : tuple[str, ...], default ("arteries",)
-        Vascular classes to process (e.g., ("arteries", "veins", "pvs")). For
-        each class, masks are expected at:
-            <masks_dir>/sub-<ID>_space-<NATIVE>_class-<CLASS>_desc-main_mask.nii.gz
-            <masks_dir>/sub-<ID>_space-MREG_class-<CLASS>_desc-main_mask.nii.gz
-        The distance map is written to:
-            <distmaps_dir>/
-            sub-<ID>_space-MREG_class-<CLASS>_desc-dist_map.nii.gz
-        (All filenames produced via `deriv_name`.)
-    mask_path : Path or None, optional
-        If provided, path to a brain mask in **MREG space**. Applied *after*
-        distance computation; voxels outside are set to **NaN** (ignored later).
-        If grid/affine differ, the mask is resampled with nearest-neighbor.
-    overwrite : bool, default False
-        If False, skip classes whose output already exists.
-    xfm : Any, deprecated
-        Ignored. Present only for backward compatibility; distance is always
-        computed in MREG space.
+        Subject-specific paths and derivatives root used to find native masks
+        and to construct output paths in `distmaps/`.
+    xfm : TransformBook
+        Transform registry providing native→T1 and T1→MNI chains, and an MNI
+        reference image for warping and EDT computation.
+    classes : tuple of {'arteries', 'veins', 'pvs'}, default=('arteries', 'veins', 'pvs')
+        Sequence of class labels to process. Unknown labels are skipped with
+        a log message.
+    overwrite : bool, default=False
+        If True, any existing MNI distance maps are recomputed; otherwise,
+        the function reuses existing files and skips computation.
 
     Returns
     -------
-    None
+    dict of str to Path or None
+        Dictionary mapping each processed class name to the corresponding
+        MNI distance-map path. If a class is skipped due to missing masks
+        or transforms, the value may be None or the key may be absent.
 
     Files written
     -------------
     - derivatives/neurofluid-mreg/sub-<ID>/distmaps/
-      sub-<ID>_space-MREG_class-<CLASS>_desc-dist_map.nii.gz  (float32, NaNs
-      outside brain if `mask_path` provided)
+      sub-<ID>_space-MNI_class-<CLASS>_desc-dist_map.nii.gz
 
     Assumptions / Preconditions
     ---------------------------
-    - Class masks exist in `masks_dir` and are binary or thresholdable.
-    - Spaces: If a class mask is not in MREG, it will be **snapped to MREG**;
-      EDT is **always** computed on the MREG grid.
-    - Affines: Any mismatch resolved by nearest-neighbor resampling (MREG route)
-      or a single linear resample (native-first route).
+    - Native-space masks exist under `sp.masks_dir` with names constructed
+      via `deriv_name(sp.sub, native_space, klass, "main", "mask")`.
+    - Transform chains required by each class (e.g., TOF→T1→MNI) are present
+      in `xfm`; missing transforms cause that class to be skipped.
+    - The MNI reference in `xfm.mni_ref_path` has zooms in mm, used to define
+      the distance units.
 
     Warnings
     --------
-    - Nearest-neighbor snapping preserves labels but may alias boundaries.    
-    - NaNs are introduced when brain-masking; downstream consumers must handle
-      them (e.g., nan-aware statistics).
-    - Existing outputs are skipped unless `overwrite=True`.
-
-    Notes
-    -----
-    - Distances are in **mm** according to the MREG header zooms.
+    - Units are assumed to be millimeters derived from the MNI header zooms;
+      verify this assumption before interpreting distance-bin definitions.
+    - If no native masks are found or all distance maps are already up to
+      date (and `overwrite` is False), the returned dictionary may be empty
+      and a summary message is printed.
     """
-    Path(sp.distmaps_dir).mkdir(parents=True, exist_ok=True)
+    out: dict[str, Path] = {}
+    masks_dir = Path(sp.masks_dir)
+    dist_dir = Path(sp.distmaps_dir)
+    dist_dir.mkdir(parents=True, exist_ok=True)
 
     for klass in classes:
-        # Prefer NATIVE mask if it exists; else fall back to MREG mask
-        native_space, native_key = _CLASS_TO_NATIVE.get(klass, (None, None))
-        mask_native = None
-        if native_space is not None:
-            candidate = (
-                Path(sp.masks_dir)
-                / deriv_name(sp.sub, native_space, klass, "main", "mask")
-            )
-            if candidate.exists():
-                mask_native = candidate
-
-        mask_mreg = (
-            Path(sp.masks_dir) / deriv_name(sp.sub, "MREG", klass, "main", "mask")
-        )
-        out_map = Path(sp.distmaps_dir) / deriv_name(sp.sub, "MREG", klass, "dist", "map")
-
-        if mask_mreg.exists():
-            # Already on MREG grid → EDT in MREG (best)
-            distance_map(sp, mask_mreg, out_map)
-        elif mask_native is not None:
-            # Fallback: snap native mask to MREG, then EDT in MREG (no distance resampling)
-            distance_map(sp, mask_native, out_map)  # xfm=None → safe route
-        else:
-            print(f"[dist] [SKIP] No mask for {klass} (native or MREG)")
+        native_space, _ = _CLASS_TO_NATIVE.get(klass, (None, None))
+        if native_space is None:
+            print(f"[dist→mni] [SKIP] Unknown class: {klass}")
             continue
 
-        # Optionally confine to brain (set outside voxels to NaN)
-        if mask_path is not None and out_map.exists():
-            try:
-                dist_img = nib.load(str(out_map))
-                dist = np.asarray(dist_img.get_fdata(), dtype=np.float32)
+        native_mask = masks_dir / deriv_name(
+            sp.sub, native_space, klass, "main", "mask"
+        )
+        if not native_mask.exists():
+            print(
+                f"[dist→mni] [SKIP] No native mask for {klass}: "
+                f"{native_mask.name}"
+            )
+            continue
 
-                brain_img = nib.load(str(mask_path))
-                brain = brain_img.get_fdata().astype(bool)
+        out_mni = dist_dir / deriv_name(
+            sp.sub, "MNI", klass, "dist", "map"
+        )
+        if out_mni.exists() and not overwrite:
+            print(f"[dist→mni] [SKIP] Exists: {out_mni.name}")
+            out[klass] = out_mni
+            continue
 
-                # Align brain mask to the distance-map grid if needed (nearest)
-                if (brain.shape != dist.shape) or (
-                    not np.allclose(brain_img.affine, dist_img.affine, atol=1e-3)
-                ):
-                    brain_res = resample_from_to(
-                        brain_img, (dist_img.shape, dist_img.affine), order=0
-                    )
-                    print("[dist] [WARN] Brain mask snapped to distance grid")
-                    brain = brain_res.get_fdata() > 0.5
+        out[klass] = distance_map_native_to_mni(
+            sp=sp,
+            xfm=xfm,
+            klass=klass,
+            native_mask_path=native_mask,
+            out_mni_path=out_mni,
+        )
 
-                dist[~brain] = np.nan  # outside brain ignored by downstream stats
-                out_hdr = dist_img.header.copy()
-                out_hdr.set_data_dtype(np.float32)
-                nib.save(nib.Nifti1Image(dist, dist_img.affine, out_hdr), str(out_map))
-                print(f"[dist] Saved → {out_map}")
-                print("[dist] Applied brain mask (NaN outside)")
-            except Exception as e:
-                print(f"[dist] Brain masking skipped (error): {e}")
+    if not out:
+        print("[dist→mni] Nothing written (no native masks or all up-to-date).")
+    return out

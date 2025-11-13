@@ -1,13 +1,15 @@
 # Neurofluid–MREG Pipeline
 
-A neuroimaging analysis pipeline for studying neurofluid dynamics using ultra-fast fMRI and high-resolution vascular images. The pipeline segments major vascular structures (arteries, veins, perivascular spaces), preprocesses MREG (Magnetic Resonance Encephalography) BOLD fMRI time series, and computes spectral power measures to analyze how physiological oscillations vary with distance from blood vessels.
+A neuroimaging analysis pipeline for studying neurofluid dynamics using ultra-fast fMRI and high-resolution vascular images. The pipeline segments major vascular structures (arteries, veins, perivascular spaces), preprocesses MREG (Magnetic Resonance Encephalography) BOLD fMRI time series, computes spectral power measures in MREG native space, and performs distance-based analysis in MNI standard space to investigate how physiological oscillations vary with distance from blood vessels.
 
 ## Features
 
 - **Vessel Segmentation**: Automated segmentation of arteries (TOF), veins (MRV), and perivascular spaces (hT2w)
 - **MREG Preprocessing**: Motion correction, detrending, and registration
-- **Distance Analysis**: Compute distance maps from vessels to analyze BOLD signal relationships
-- **Spectral Analysis**: Frequency-band power mapping and statistical analysis
+- **Spectral Analysis**: Frequency-band power mapping in MREG native space with optional export to MNI
+- **Distance Analysis**: Compute distance maps in MNI space to analyze BOLD signal relationships with vessel proximity
+- **MNI-Based Statistics**: Clustering and statistical analysis performed in standard MNI space for group-level compatibility
+- **Radii Analysis**: Vessel radius mapping in MNI space to investigate power variations with vessel size
 - **BIDS-Compatible**: All inputs and outputs follow BIDS-like format
 - **Configurable**: Single YAML configuration file for full pipeline control
 
@@ -61,6 +63,8 @@ bids_root/
 - **Optional**: MRV (veins), hT2w (PVS), MP2RAGE inversions
 - Pipeline automatically skips steps for missing optional data
 - **Note**: For more accurate and robust vessel and PVS segmentation, it is recommended to brain mask anatomical images before segmentation. This minimizes false positives from non-brain regions and ensures cleaner results.
+- **Note**: For more accurate and robust analysis, it is recommended to apply distortion correction on the MREG before frequency analysis.
+
 
 ## Usage
 
@@ -111,7 +115,6 @@ from pathlib import Path
 cfg = PipelineConfig.from_yaml(Path("pipeline.yaml"))
 ```
 
-
 Then, you can run the pipeline (adjust paths as needed):
 
 ```bash
@@ -132,16 +135,16 @@ Results are organized in BIDS-derivative format:
 derivatives/neurofluid-mreg/sub-<ID>/
 ├── anat/ # Anatomical derivatives and transforms
 ├── masks/ # Vessel segmentation masks and skeletons
-├── distmaps/ # Distance maps from vessels
-├── mreg/ # Processed MREG fMRI data
-├── bandmaps/ # Band power maps
-├── clusters/ # Distance-based cluster masks
-├── spectra/ # Spectral analysis outputs
-├── stats/ # Statistical result files
+├── distmaps/ # Distance maps from vessels (MNI space)
+├── mreg/ # Processed MREG fMRI data (native MREG space)
+├── bandmaps/ # Band power maps (MREG space + MNI exports)
+├── clusters/ # Distance-based cluster masks (MNI space)
+├── spectra/ # Spectral analysis outputs (MREG space)
+├── stats/ # Statistical result files (MNI space)
 ├── figures/ # Summary plots and figures
 ├── qc/ # Quality control figures
 ├── manifest/ # Manifest/record files
-└── radii/ # Vessel radii files
+└── radii/ # Vessel radii files (MNI space)
 ```
 
 ### Output Files
@@ -151,34 +154,54 @@ derivatives/neurofluid-mreg/sub-<ID>/
 - `*_desc-main_mask.nii.gz`: Binary vessel masks
 - `*_desc-skeleton_mask.nii.gz`: Vessel centerlines
 
-#### Preprocessing Outputs
-- `*_desc-detrended_bold.nii.gz`: Preprocessed fMRI
-- `*_desc-mean_map.nii.gz`: Mean fMRI image
+#### Preprocessing Outputs (MREG Space)
+- `*_space-MREG_desc-detrended_bold.nii.gz`: Preprocessed fMRI in native MREG space
+- `*_space-MREG_desc-mean_map.nii.gz`: Mean fMRI image in native MREG space
 
 #### Registration Outputs
 - `*_xfm-*to*.txt`: Affine transform matrices
 - `*_xfm-*_warp.nii.gz`: Nonlinear deformation fields
 
-#### Analysis Outputs
-- `*_band-*_desc-power_map.nii.gz`: Spectral power maps per frequency band
-- `*_desc-clusters_mask.nii.gz`: Distance-based cluster labels
-- `*_desc-binned_bandpower.csv`: Statistical summaries
-- `*.png`: Analysis plots and figures
+#### Spectral Analysis Outputs
+
+**In MREG Native Space:**
+- `*_space-MREG_band-cardiac_desc-power_map.nii.gz`: Cardiac band power map
+- `*_space-MREG_band-respiratory_desc-power_map.nii.gz`: Respiratory band power map
+- `*_space-MREG_band-LF_desc-power_map.nii.gz`: Low-frequency band power map
+- `*_space-MREG_band-VLF_desc-power_map.nii.gz`: Very-low-frequency band power map
+- `*_space-MREG_desc-meanamp_map.nii.gz`: Mean amplitude across all bands
+- `*_space-MREG_class-<arteries|veins|pvs>_desc-cluster_spectra.npz`: Cluster-averaged spectra
+
+**Exported to MNI Space:**
+- `*_space-MNI_band-cardiac_desc-power_map.nii.gz`: Cardiac band power in MNI space
+- `*_space-MNI_band-respiratory_desc-power_map.nii.gz`: Respiratory band power in MNI space
+- `*_space-MNI_band-LF_desc-power_map.nii.gz`: Low-frequency band power in MNI space
+- `*_space-MNI_band-VLF_desc-power_map.nii.gz`: Very-low-frequency band power in MNI space
+- `*_space-MNI_desc-meanamp_map.nii.gz`: Mean amplitude in MNI space
+
+#### Distance & Analysis Outputs (MNI Space)
+- `*_space-MNI_class-arteries_desc-distance_map.nii.gz`: Euclidean distance map from arteries in MNI space
+- `*_space-MNI_class-arteries_desc-radius_map.nii.gz`: Vessel radius map for arteries in MNI space
+- `*_space-MNI_class-arteries_desc-clusters_mask.nii.gz`: Distance-based cluster labels in MNI space
+- `*_space-MNI_class-arteries_desc-binned_stats.csv`: Binned statistics (power by distance bin)
+- `*_space-MNI_class-arteries_desc-continuous_stats.csv`: Continuous regression statistics (power vs distance)
+- `*_space-MNI_class-arteries_desc-radius_vs_power.csv`: Radius-based statistics
+
+#### Visualization Outputs
+- `*_space-MREG_class-arteries_desc-cluster_spectra.png`: Cluster spectra plots (MREG space)
+- `*_space-MNI_class-arteries_desc-binned_bandpower.png`: Binned power plots (MNI space)
+- `*_space-MNI_class-arteries_band-cardiac_desc-continuous.png`: Continuous regression plots (MNI space)
+- `*_space-MNI_class-arteries_desc-radius_vs_power.png`: Radius vs power scatter plots (MNI space)
 
 ## Pipeline Workflow
 
 The pipeline executes the following stages:
 
 ### 1. Vessel Segmentation
-- Segments arteries from TOF using Frangi vesselness filtering
-- Segments veins from multi-echo MRV (R2* mapping)
-- Segments perivascular spaces from high-res T2w
-- Generates masks, vesselness maps, and skeletons for each structure
+Segments arteries from TOF using Frangi vesselness filtering, veins from multi-echo MRV (R2* mapping), and perivascular spaces from high-res T2w. Generates masks, vesselness maps, and skeletons for each structure in their native spaces.
 
 ### 2. MREG Preprocessing
-- Motion correction using NiPy's 4D realignment
-- Polynomial detrending to remove slow drifts
-- Temporal mean computation
+Motion correction using NiPy's 4D realignment, polynomial detrending to remove slow drifts, and temporal mean computation. All preprocessing is performed in the native MREG functional space.
 
 ### 3. Registration
 - Affine registration: MREG mean → T1w
@@ -187,23 +210,36 @@ The pipeline executes the following stages:
 - Apply transforms to full fMRI time series and masks
 
 ### 4. Brain Masking
-- Generate brain mask in MNI space
-- Project mask to T1w and MREG spaces
+Generate brain mask in MNI space and project mask to T1w and MREG spaces.
 
-### 5. Distance Mapping
-- Compute Euclidean distance transform for each vessel class
-- Generate distance maps in MREG space (mm units)
+### 5. Spectral Analysis (MREG Native Space)
+Compute voxel-wise FFT and extract band-specific power in the native MREG functional space. Group voxels by distance from vessels and compute cluster spectra. Store all bandpower maps in MREG space.
 
-### 6. Spectral Analysis
-- Compute voxel-wise FFT and extract band-specific power
-- Group voxels by distance from vessels
-- Statistical analysis (ANOVA, regression) of power vs distance
-- Optional: Analyze power vs vessel radius
+### 6. Export Bandpower to MNI (Optional)
+Transform bandpower maps from MREG native space to MNI standard space using the computed registration transforms. This enables group-level spectral analysis while preserving the native-space computation.
 
-### 7. Visualization
+### 7. Distance Mapping (MNI Space)
+Compute Euclidean distance transform for each vessel class in MNI space. Generate distance maps in mm units, establishing the spatial relationship between voxels and vessel structures in standard space.
+
+### 8. Distance-Based Clustering (MNI Space)
+- Create binary clusters based on predefined distance bins from vessel structures
+- Generate cluster masks labeled by distance range (e.g., 0–2 mm, 2–5 mm, etc.)
+- Store all cluster masks in MNI space
+
+### 9. Binned Statistics Analysis (MNI Space)
+Perform statistical analysis of bandpower vs distance using distance-based clusters. Extract mean power values for each band within each distance bin, generate summary tables and visualization plots showing power variation with distance from vessels in MNI space.
+
+### 10. Continuous Statistical Analysis (MNI Space)
+Perform robust linear regression of bandpower (log-transformed) against continuous distance values for all voxels within the brain mask in MNI space. Generate regression coefficients, p-values, and visualization plots for each frequency band.
+
+### 11. Radii Analysis (MNI Space)
+Compute local vessel diameter at each centerline voxel using 2D Gaussian fitting. Analyze BOLD power vs vessel radius by extracting power values within radius-defined annuli around vessel structures. Generate regression analysis and visualization plots.
+
+### 12. Visualization & Quality Control
 - Generate QC plots for segmentation and registration
-- Create summary plots for spectral analysis
+- Create summary plots for spectral analysis in both MREG and MNI spaces
 - Output cluster spectra and distance-power relationships
+- Produce publication-ready figures
 
 ## Quality Control
 
@@ -211,8 +247,9 @@ Quality control outputs are saved in the `qc/` subdirectory:
 
 - Vessel segmentation visualizations
 - Motion parameters from fMRI realignment
-- Registration quality checks
+- Registration quality checks (MREG → T1w → MNI)
 - Spectral analysis summary plots
+- Distance map visualizations in MNI space
 
 Review these outputs to verify each processing step completed successfully.
 
@@ -220,14 +257,14 @@ Review these outputs to verify each processing step completed successfully.
 
 ### Vessel Radii Analysis
 
-Enable radius estimation along vessel centerlines:
+Enable radius estimation along vessel centerlines in MNI space:
 
 ```yaml
 radii_enabled: true
 radii_overwrite: false
 ```
 
-This computes local vessel diameter at each centerline voxel using 2D Gaussian fitting. Results are used to analyze BOLD power vs vessel size.
+This computes local vessel diameter at each centerline voxel using 2D Gaussian fitting. Radius maps are generated in MNI space, and results are used to analyze BOLD power vs vessel size. Results are saved as both continuous radius maps and binned statistics.
 
 ### MP2RAGE Denoising
 
@@ -254,9 +291,18 @@ sub-<ID>_space-<SPACE>_class-<CLASS>_desc-<DESC>_<SUFFIX>.nii.gz
 ```
 
 - `space`: Image space (TOF, MRV, T1, MREG, MNI)
+  - **MREG**: Native functional space (for bandpower maps and spectra)
+  - **MNI**: Standard stereotactic space (for distance maps, statistics, and analysis)
+  - **T1**: Anatomical space (for intermediate registration products)
 - `class`: Structure type (arteries, veins, pvs, brain)
-- `desc`: Description (vesselness, main, skeleton, detrended, etc.)
-- `suffix`: File type (map, mask, bold, etc.)
+- `desc`: Description (vesselness, main, skeleton, detrended, power_map, clusters, binned_stats, continuous_stats, radius_vs_power, etc.)
+- `suffix`: File type (nii.gz for images, csv for statistics, npz for numpy arrays)
+
+**Key Space Conventions:**
+- Bandpower maps are computed and stored in `space-MREG` (native fMRI space)
+- Bandpower maps are also exported to `space-MNI` for group-level analysis
+- Distance maps, clustering, and statistics are all performed in `space-MNI` (standard space)
+- Spectral analysis and cluster labels are computed in `space-MREG` using MNI-derived cluster boundaries transformed back to native space
 
 ## Troubleshooting
 
@@ -270,6 +316,10 @@ sub-<ID>_space-<SPACE>_class-<CLASS>_desc-<DESC>_<SUFFIX>.nii.gz
 
 **Segmentation Quality**: Review vesselness maps and adjust thresholds if needed. Some parameters may require tuning for specific datasets.
 
+**MNI Registration Issues**: Verify that T1w → MNI nonlinear registration completed successfully. Check QC figures for obvious alignment problems.
+
+**Missing MNI Distance Maps**: Ensure that the T1w → MNI transformation was computed. If veins or PVS distance maps are missing in MNI space, it may indicate segmentation failed for these structures.
+
 ## Citation
 
 If you use this pipeline in your research, please cite:
@@ -277,10 +327,10 @@ If you use this pipeline in your research, please cite:
 ```
 Hussain, Yasin Tashraf; Mattern, Hendrik (2025).
 Neurofluid–MREG: BIDS-first vascular segmentation and spectral analysis pipeline.
-Open-source pipeline linking ultra-fast MREG BOLD signals to vascular structures via segmentation, distance/radii mapping, and band-limited spectral analysis.
+Open-source pipeline linking ultra-fast MREG BOLD signals to vascular structures via segmentation, distance/radii mapping in MNI space, and band-limited spectral analysis in native MREG space.
 Otto-von-Guericke University Magdeburg, Germany.
-GitHub Repository: https://github.com/your-username/neurofluid-mreg
-Version 0.1.0, Released 2025-11-03.
+GitHub Repository: https://github.com/yasintashraf/neurofluid-mreg
+Version 0.2.0, Released 2025-11-25.
 ```
 
 ## License
@@ -317,9 +367,9 @@ contributed to the conceptual development of this project.
 
 ## Contact
 
-For questions and support, please open an issue on the GitHub repository, or contact yasin.tashraf@st.ovgu.de or yasintashraf14@gmail.com
+For questions and support, please open an issue on the GitHub repository.
 
 ---
 
-**Version**: 1.0.0  
+**Version**: 0.2.0  
 **Last Updated**: November 2025

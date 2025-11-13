@@ -75,8 +75,7 @@ from neurofluid_mreg.io import (
 # -------------------------------------------------------------
 # Masking (MREG/T1/MNI paths)
 # -------------------------------------------------------------
-from neurofluid_mreg.masking import mask_brain
-from neurofluid_mreg.masking import compute_t1_mask_via_mni_and_project
+from neurofluid_mreg.masking import compute_mni_brain_mask_once #compute_t1_mask_via_mni_and_project
 
 # -------------------------------------------------------------
 # Thresholding / post-processing / skeletonization (segmentation)
@@ -95,9 +94,7 @@ from neurofluid_mreg.radii import (
 # -------------------------------------------------------------
 from neurofluid_mreg.transforms import (
     TransformBook,
-    run_mp2rage_denoise,
-    warp_radii_to_mreg,
-)
+    run_mp2rage_denoise)
 
 # -------------------------------------------------------------
 # Preprocessing (MREG) and mask warps
@@ -105,14 +102,14 @@ from neurofluid_mreg.transforms import (
 from neurofluid_mreg.mreg import (
     realign_and_detrend_mreg,
     compute_mreg_mean,
-    warp_masks_single_shot,
     apply_mean_xfm_to_full_mreg,
+    export_bandpower_to_mni,
 )
 
 # -------------------------------------------------------------
 # Distance maps
 # -------------------------------------------------------------
-from neurofluid_mreg.distance import generate_distance_maps
+from neurofluid_mreg.distance import generate_distance_maps_mni
 
 # -------------------------------------------------------------
 # Spectral analysis
@@ -183,31 +180,17 @@ def main():
     # 1) SEGMENTATION (native)
     # -------------------------
     print("\n[STEP] Segmentation (native spaces)")
-    if sp.anat_tof and Path(sp.anat_tof).exists():
-        arteries_tof(Path(sp.anat_tof), Path(sp.masks_dir))
-    else:
-        print("[arteries] [SKIP] TOF not provided or missing")
-    if sp.anat_mrv and Path(sp.anat_mrv).exists():
-        veins_mrv(Path(sp.anat_mrv), Path(sp.masks_dir))
-    else: 
-        print("[veins] [SKIP] MRV not provided or missing")
-    if sp.anat_heavy_t2w and Path(sp.anat_heavy_t2w).exists():
-        pvs_ht2w(Path(sp.anat_heavy_t2w), Path(sp.masks_dir), use_epc=True, t1_path=None)
-    else: 
-        print("[pvs] [SKIP] HT2w/T2w not provided or missing")
+    arteries_tof(Path(sp.anat_tof), Path(sp.masks_dir), overwrite=False)
 
-    # 1b) Radii (native spaces) — toggled only by YAML: radii_enabled
-    if getattr(cfg, "radii_enabled", False):
-        print("\n[STEP] Centerline radii (native spaces)")
-        ow = bool(getattr(cfg, "radii_overwrite", False))
-        _r = compute_radii_for_subject(
-            sp,
-            classes=None,  # auto-detect available classes
-            search_radius=2,
-            overwrite=ow,
-        )
-        if not _r:
-            print("[radii] Nothing computed (check images/masks/skeletons).")
+    if sp.anat_mrv and Path(sp.anat_mrv).exists():
+        veins_mrv(Path(sp.anat_mrv), Path(sp.masks_dir), overwrite=False)
+    else:
+        print("[veins] [SKIP] MRV not provided or missing")
+
+    if sp.anat_heavy_t2w and Path(sp.anat_heavy_t2w).exists():
+        pvs_ht2w(Path(sp.anat_heavy_t2w), Path(sp.masks_dir), use_epc=False, t1_path=None, overwrite=False)
+    else:
+        print("[pvs] [SKIP] HT2w/T2w not provided or missing")
 
     # -----------------------------------
     # 2) MREG PREPROC (realign + detrend)
@@ -215,18 +198,8 @@ def main():
     print("\n[STEP] MREG preprocessing (realign + detrend)")
     realign_and_detrend_mreg(sp, overwrite=False)
 
-    # Resolve realigned 4D path (written by the step above)
-    realigned_4d = Path(sp.mreg_dir) / deriv_name(
-        sp.sub, "MREG", "brain", "motionrealigned", "bold"
-    )
-
-    # 2a) Mask from REALIGNED 4D (EPI mask) — final brain mask for downstream
-    mreg_mask_epi = Path(sp.masks_dir) / deriv_name(
-        sp.sub, "MREG", "brain", "brain", "mask"
-    )
-    mask_brain(realigned_4d, mreg_mask_epi, overwrite=False)
-    mreg_brain_mask = mreg_mask_epi  # single source of truth for downstream steps
-    print(f"[INFO] Using EPI mask (final): {mreg_brain_mask}")
+    # Resolve realigned 4D (written by the step above)
+    realigned_4d = Path(sp.mreg_dir) / deriv_name(sp.sub, "MREG", "brain", "motionrealigned", "bold")
 
     # 2b) Mean from REALIGNED 4D (for registration, QC)
     print("\n[STEP] Compute MREG mean (3D)")
@@ -238,7 +211,7 @@ def main():
     print("\n[STEP] Estimate core transforms")
     xfm = TransformBook(sp)
 
-    # Optional T1 denoise via MP2RAGE if you have INV1/INV2 and the helper
+    # Optional T1 denoise via MP2RAGE if available
     t1_for_reg = Path(sp.anat_t1w)
     if run_mp2rage_denoise and sp.anat_inv1 and sp.anat_inv2:
         if Path(sp.anat_inv1).exists() and Path(sp.anat_inv2).exists():
@@ -252,140 +225,121 @@ def main():
             )
 
     # Ensure core transforms exist and are saved
-    mreg_mean_img = Path(sp.mreg_dir) / deriv_name(
-        sp.sub, "MREG", "brain", "mean", "map"
-    )
+    mreg_mean_img = Path(sp.mreg_dir) / deriv_name(sp.sub, "MREG", "brain", "mean", "map")
     xfm.estimate_and_save_core_transforms(
         t1_denoised_path=t1_for_reg,
         tof_path=Path(sp.anat_tof),
         mreg_mean_path=mreg_mean_img,
-        mrv_path=(
-            Path(sp.anat_mrv)
-            if sp.anat_mrv and Path(sp.anat_mrv).exists()
-            else None
-        ),
-        ht2w_path=(
-            Path(sp.anat_heavy_t2w)
-            if sp.anat_heavy_t2w and Path(sp.anat_heavy_t2w).exists()
-            else None
-        ),
+        mrv_path=(Path(sp.anat_mrv) if sp.anat_mrv and Path(sp.anat_mrv).exists() else None),
+        ht2w_path=(Path(sp.anat_heavy_t2w) if sp.anat_heavy_t2w and Path(sp.anat_heavy_t2w).exists() else None),
         mni_path=None,
     )
 
     if getattr(cfg, "make_t1_bold_4d", False):
-        apply_mean_xfm_to_full_mreg(
-            sp,
-            xfm,
-            overwrite=False,
-            also_mni=False,  # not implemented
-        )
+        apply_mean_xfm_to_full_mreg(sp, xfm, overwrite=False, also_mni=False)  # not implemented
 
-    print("\n[STEP] T1 masking via MNI → project to T1/MREG")
-    compute_t1_mask_via_mni_and_project(
-        sub=sp.sub,
-        t1_path=Path(t1_for_reg),
-        mreg_ref_path=Path(mreg_mean_img),
-        xfm=xfm,
-        masks_dir=Path(sp.masks_dir),
-        overwrite=False,
-    )
+    # -----------------------------
+    # 3b) Subject brain mask in MNI
+    # -----------------------------
+    print("\n[STEP] Compute subject MNI brain mask (single, reused everywhere)")
+    mask_mni = compute_mni_brain_mask_once(sp, xfm, t1_path=Path(t1_for_reg), overwrite=False)
 
-    # -----------------------------------------
-    # 4) WARP MASKS → MREG (and optional → MNI)
-    # -----------------------------------------
-    print("\n[STEP] Warp masks → MREG/MNI")
-    warp_masks_single_shot(
-        sp, xfm, also_mni=cfg.make_mni, clip_with_mreg_mask=mreg_brain_mask
-    )
+    # ----------------------------------------------------
+    # 4) RADII (MNI grid) – after MNI anatomicals exist
+    # ----------------------------------------------------
+    if getattr(cfg, "radii_enabled", False):
+        print("\n[STEP] Centerline radii (MNI space)")
+        ow = bool(getattr(cfg, "radii_overwrite", False))
+        compute_radii_for_subject(sp, classes=None, search_radius=2, overwrite=ow,image_space="MNI",seg_space="MNI", image_override=None, allow_on_the_fly_skeleton=True)
 
-    print("\n[STEP] Warp radii → MREG")
-    warp_radii_to_mreg(
-        sp,
-        xfm,
-        mreg_ref_path=mreg_mean_img,
-        t1_ref_path=Path(t1_for_reg),
-        overwrite=False,
-    )
+    else:
+        print("[radii] [SKIP] Disabled via YAML")
+
+    # # (Legacy compatibility) — if it expects MREG radii, keep this.
+    # print("\n[STEP] Warp radii → MREG (compat for legacy analysis)")
+    # warp_radii_to_mreg( sp, xfm, mreg_ref_path= mreg_mean_img, t1_ref_path=Path(t1_for_reg), overwrite=False,)
 
     # ----------------------------
-    # 5) DISTANCE MAPS (MREG grid)
+    # 5) DISTANCE MAPS (MNI grid)
     # ----------------------------
-    print("\n[STEP] Distance maps (MREG space)")
+    print("\n[STEP] Distance maps (MNI space)")
     Path(sp.distmaps_dir).mkdir(parents=True, exist_ok=True)
-    generate_distance_maps(
-        sp,
-        classes=("arteries", "veins", "pvs"),
-        mask_path=mreg_brain_mask,
-        overwrite=True, xfm=xfm,)
-    
-    # dist_arteries = Path(sp.distmaps_dir) / deriv_name(
-    #     sp.sub, "MREG", "arteries", "dist", "map"
-    # )
+    generate_distance_maps_mni(
+        sp, xfm=xfm, classes=("arteries", "veins", "pvs"), overwrite=True)
 
-    # ---------------------------------------------
-    # 6) SPECTRAL BAND MAPS + CLUSTERS + STATS/QC
-    # ---------------------------------------------
-    print("\n[STEP] Spectral band maps")
+    # -------------------------------------------------------------
+    # 5b) SPECTRAL BAND MAPS (compute in MREG, then export to MNI)
+    # -------------------------------------------------------------
+    print("\n[STEP] Spectral band maps (compute in MREG)")
     bands = cfg.bands or BANDS_DEFAULT
-    band_paths = compute_bandpower_maps(
-        sp, tr=None, bands=bands, mask_path=mreg_brain_mask, overwrite=True
-    )
+    compute_bandpower_maps(sp, tr=None, bands=bands, mask_path=None, overwrite=True)
 
-    print("\n[STEP] Distance clusters")
+    print("\n[STEP] Export bandpower maps → MNI")
+    export_bandpower_to_mni(sp, xfm, t1_path=Path(t1_for_reg), overwrite=False)
+
+    # ---------------------------------------------
+    # 6) CLUSTERS + STATS/QC  (MNI)
+    # ---------------------------------------------
+    print("\n[STEP] Distance clusters (MNI)")
     cluster_paths = {}
-    classes_to_cluster = ("arteries", "veins", "pvs")
-    for klass in classes_to_cluster:
-        dist_map = Path(sp.distmaps_dir) / deriv_name(sp.sub, "MREG", klass, "dist", "map")
+    for klass in ("arteries", "veins", "pvs"):
+        dist_map = Path(sp.distmaps_dir) / deriv_name(sp.sub, "MNI", klass, "dist", "map")
         if dist_map.exists():
-            out_path = make_distance_clusters(
-                sp,
-                dist_map_path=dist_map,
-                klass=klass,
-                bins=cfg.distance_bins or DIST_BINS_DEFAULT,
-                overwrite=True,
-            )
+            out_path = make_distance_clusters( sp, dist_map_path=dist_map, klass=klass, bins=cfg.distance_bins or DIST_BINS_DEFAULT, overwrite=True,)
             cluster_paths[klass] = out_path
         else:
-            print(f"[clusters] No distance map for {klass}; skipping.")
+            print(f"[clusters] No MNI distance map for {klass}; skipping.")
 
-    print("\n[STEP] Binned stats + figures")
+    print("\n[STEP] Binned stats + figures (MNI)")
     for klass, labels_path in cluster_paths.items():
         analyze_binned(sp, labels_path, klass=klass, bands=bands, overwrite=True)
 
-    print("\n[STEP] Cluster spectra + figures")
-    for klass, labels_path in cluster_paths.items():
-        cluster_spectra(sp, labels_path, klass=klass, max_hz=2.0, overwrite=True)
+    print("\n[STEP] MNI → MREG cluster labels (for spectra)")
+    for klass, labels_path_mni in cluster_paths.items():
+        # 1) MNI → T1
+        labels_path_t1 = Path(sp.clusters_dir) / deriv_name(sp.sub, "T1", klass, "clusters", "mask")
+        if not labels_path_t1.exists():
+            xfm.warp_labels(
+                moving_img=str(labels_path_mni),
+                reference_img=str(Path(sp.anat_t1w)),
+                out_path=str(labels_path_t1),
+                chain=("MNI", "T1"), interpolation="nearest",)
+        
+        # 2) T1 → MREG
+        labels_path_mreg = Path(sp.clusters_dir) / deriv_name(sp.sub, "MREG", klass, "clusters", "mask")
+        if not labels_path_mreg.exists():
+            xfm.warp_labels(
+                moving_img=str(labels_path_t1),
+                reference_img=str(mreg_mean_img),
+                out_path=str(labels_path_mreg),
+                chain=("T1", "MREG"), interpolation="nearest",)
+            print(f"[clusters] Saved MREG labels → {labels_path_mreg}")
 
-    # Optional: single-frequency map (e.g., cardiac 1.0 Hz)
+        # Compute spectra on the MREG grid
+        cluster_spectra(sp, labels_path_mreg, klass=klass, max_hz=2.0, overwrite=True)
+
+    # Optional: single-frequency map on MREG grid (QC)
     frequency_map(sp, freq_hz=1.0)
 
     # ---------------------------------------------
-    # 7) CONTINUOUS: band power ~ distance (per class/band)
+    # 7) CONTINUOUS: power ~ distance (MNI)
     # ---------------------------------------------
-    print("\n[STEP] Continuous stats + figures (robust linear on log1p(power))")
+    print("\n[STEP] Continuous stats + figures (MNI; robust linear on log1p(power))")
     for klass in ("arteries", "veins", "pvs"):
-        dist_map = Path(sp.distmaps_dir) / deriv_name(sp.sub, "MREG", klass, "dist", "map")
+        dist_map = Path(sp.distmaps_dir) / deriv_name(sp.sub, "MNI", klass, "dist", "map")
         if not dist_map.exists():
-            print(f"[continuous] No distance map for {klass}; skipping.")
+            print(f"[continuous] No MNI distance map for {klass}; skipping.")
             continue
-        analyze_continuous(
-            sp,
-            dist_map_path=dist_map,
-            bands=bands,
-            mask_path=mreg_brain_mask,
-            overwrite=True,
-        )
+        analyze_continuous(sp, dist_map_path=dist_map, bands=bands, mask_path=mask_mni, overwrite=True,)
 
+    # ---------------------------------------------
+    # 8) RADIUS vs POWER
+    # ---------------------------------------------
     print("\n[STEP] Radius vs Power")
+    # Later: once analyze_radius_vs_power supports MNI, call it with radii_path in MNI.
     for klass in ("arteries", "veins", "pvs"):
-        analyze_radius_vs_power(
-            sp,
-            klass,
-            bands=bands,
-            band_paths=band_paths,
-            mask_path=mreg_brain_mask,
-            overwrite=True,
-        )
+        radii_path = Path(sp.radii_dir) / deriv_name(sp.sub, "MNI", klass, "radius", "map")
+        analyze_radius_vs_power(sp, klass, bands=bands, radii_path=radii_path, band_paths=None, mask_path=mask_mni, overwrite=False,)
 
     print("\n[DONE] Pipeline finished.")
 

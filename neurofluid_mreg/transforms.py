@@ -29,6 +29,7 @@ Files written
 - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-<TAG>toT1.txt
 - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-T1toMNI_warp.nii.gz
 - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-MNItoT1_warp.nii.gz
+- derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_space-MNI_desc-T1w_in-MNI_map.nii.gz
 - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-T1toMREG.txt
 - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-MREGMEANtoMNI.txt
 - Additional resampled artifacts per caller (e.g., masks/radii) using
@@ -59,12 +60,15 @@ Public API
 - TransformBook
 - warp_radii_to_mreg
 - run_mp2rage_denoise
+- push_to_mni_float
+- push_to_mni_label
+- warp_t1_to_mni_once
 """
-import os
 from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+import os
 import numpy as np
 import nibabel as nib
 from nibabel.processing import resample_from_to
@@ -224,7 +228,7 @@ def register_t1_to_ht2w(
     com = transform_centers_of_mass(static, static_aff, moving, moving_aff)
 
     metric = MutualInformationMetric(nbins=mi_bins, sampling_proportion=0.3)
-    level_iters = [1000, 100, 10]  # tuned elsewhere; logic unchanged
+    level_iters = [1,1,1]#[1000, 100, 10]  # tuned elsewhere; logic unchanged
     sigmas = [3.0, 1.0, 0.0]
     factors = [4, 2, 1]
     affreg = AffineRegistration(
@@ -352,7 +356,7 @@ def register_to_t1(
     mi = MutualInformationMetric(nbins=32, sampling_proportion=None)
 
     # Multires pyramid
-    level_iters = [1000, 100, 10]  # tuned elsewhere; logic unchanged
+    level_iters = [1,1,1] #[1000, 100, 10]  # tuned elsewhere; logic unchanged
     sigmas = [3.0, 1.0, 0.0]
     factors = [4, 2, 1]
 
@@ -452,7 +456,7 @@ def register_t1_to_mni(
 
     # 2) short rigid MI optimization (handles rotation/scale better than COM alone)
     mi = MutualInformationMetric(nbins=32)
-    level_iters = [1000, 100, 10]
+    level_iters =[1,1,1]# [1000, 100, 10]
     affreg = AffineRegistration(metric=mi, level_iters=level_iters)
     print(f"[xfm] Pre-rigid pyramid (T1→MNI): iters={level_iters}")
     rigid = RigidTransform3D()
@@ -615,6 +619,7 @@ def apply_affine_then_warp_to_mni(
     - For 4D, frames are resampled independently.
     - Operates in image space; geometry pulled to T1 then warped to MNI.
     """
+
     img = nib.load(str(image_path))
     data = img.get_fdata().astype(np.float32)
     mni = nib.load(str(mni_path))
@@ -879,8 +884,14 @@ class TransformBook:
             Output NIfTI path (written).
         chain : tuple, default=("MNI", "T1")
             Supported chains:
-              - ("MNI","T1")  : inverse T1↔MNI map → snap to requested T1 grid.
-              - ("T1","MREG") : 4×4 T1→MREG affine.
+              - ("MNI","T1")
+                Inverse T1↔MNI map → snap MNI labels to the requested T1 grid.
+              - ("T1","MREG")
+                4×4 T1→MREG affine baked into header, then resampled to MREG.
+              - ("TOF","MNI"), ("MRV","MNI"), ("HT2w","MNI")
+                Compose (src→T1 affine) with stored T1↔MNI warp via
+                `apply_affine_then_warp_to_mni` (nearest for labels, linear for
+                images depending on `interpolation`).
         interpolation : {"nearest","linear"}, default="nearest"
             Resampling order; labels should use "nearest".
 
@@ -891,7 +902,7 @@ class TransformBook:
         Raises
         ------
         RuntimeError
-            If MNI mapping is requested but unavailable.
+            If a required affine or T1↔MNI mapping is missing.
         NotImplementedError
             If the `chain` is unsupported.
         """
@@ -943,7 +954,38 @@ class TransformBook:
 
             nib.save(out_img, out_path)
             return
+        
+        if chain[1] == "MNI" and chain[0].upper() in ("TOF", "MRV", "hT2w"):
+            if getattr(self, "_mapping_cache", None) is None or getattr(self, "mni_ref_path", None) is None:
+                raise RuntimeError("No T1↔MNI mapping cached. Did you skip T1→MNI registration?")
 
+            # Normalize source token 
+            src_token = chain[0].upper()
+            src_key_map = {
+                "TOF":  "tof_to_t1",
+                "MRV":  "mrv_to_t1",
+                "hT2w": "ht2w_to_t1",
+            }
+            src_key = src_key_map[src_token]
+
+            try:
+                affine_txt = self.get(src_key)
+            except KeyError:
+                # This is what you already see for missing MRV/HT2w affines
+                raise RuntimeError(f"Missing affine '{src_key}'. Available: {list(self.paths.keys())}")
+
+            # nearest => labels, linear => images
+            is_label = (interpolation == "nearest")
+
+            apply_affine_then_warp_to_mni(
+                image_path=Path(moving_img),
+                affine_txt=Path(affine_txt),
+                mapping=self._mapping_cache,
+                mni_path=self.mni_ref_path,   # enforce the same MNI grid used for registration
+                out_path=Path(out_path),
+                is_label=is_label,
+            )
+            return
         raise NotImplementedError(f"Unsupported chain {chain}")
 
 
@@ -1123,3 +1165,222 @@ def run_mp2rage_denoise(uni_path: Path,
                     corner_width=corner_width)
     print(f"[mp2rage] Saved → {out_path}")  # keep your existing style here
     return out_path
+
+
+def push_to_mni_float(
+    image_path: Path,
+    *,
+    src_to_t1_txt: Path,
+    xfm: TransformBook,
+    out_path: Path,
+) -> Path:
+    """
+    Resample a source image to MNI via (src→T1 affine) + (T1→MNI warp), float.
+
+    Parameters
+    ----------
+    image_path : pathlib.Path
+        Path to the source image in its native space (e.g., TOF/MRV/hT2w/MREG).
+    src_to_t1_txt : pathlib.Path
+        4×4 affine text file describing the src→T1 mapping (as produced by
+        `register_to_t1`).
+    xfm : TransformBook
+        Must expose a cached T1↔MNI mapping (`_mapping_cache`) and, ideally,
+        `mni_ref_path`. If `mni_ref_path` is missing, a canonical MNI template
+        is resolved via `_resolve_mni_path`.
+    out_path : pathlib.Path
+        Output NIfTI path in MNI space (caller controls BIDS naming).
+
+    Returns
+    -------
+    pathlib.Path
+        `out_path` of the written MNI-space image (float32).
+
+    Files written
+    -------------
+    - Output NIfTI at `out_path` in space-MNI (float32).
+
+    Assumptions / Preconditions
+    ---------------------------
+    - `xfm._mapping_cache` was created by `register_t1_to_mni` and matches the
+      T1 used to derive `src_to_t1_txt`.
+    - Linear interpolation is appropriate for the quantity being resampled
+      (e.g., band-power maps, intensities).
+
+    Warnings
+    --------
+    - If the T1 used in `src_to_t1_txt` does not match the T1 used for the
+      T1↔MNI mapping, misalignment may occur.
+
+    Raises
+    ------
+    RuntimeError
+        If `xfm._mapping_cache` is missing (indirectly via
+        `apply_affine_then_warp_to_mni`).
+    """
+    mni_ref = xfm.mni_ref_path if getattr(xfm, "mni_ref_path", None) else _resolve_mni_path()
+    return apply_affine_then_warp_to_mni(
+        image_path=image_path,
+        affine_txt=src_to_t1_txt,
+        mapping=xfm._mapping_cache,
+        mni_path=mni_ref,
+        out_path=out_path,
+        is_label=False,  # linear
+    )
+
+
+def push_to_mni_label(
+    image_path: Path,
+    *,
+    src_to_t1_txt: Path,
+    xfm: TransformBook,
+    out_path: Path,
+) -> Path:
+    """
+    Resample a label-like image to MNI via (src→T1 affine) + (T1→MNI warp).
+
+    Parameters
+    ----------
+    image_path : pathlib.Path
+        Path to the source label/segmentation in its native space.
+    src_to_t1_txt : pathlib.Path
+        4×4 affine text file describing the src→T1 mapping (as produced by
+        `register_to_t1`).
+    xfm : TransformBook
+        Must expose a cached T1↔MNI mapping (`_mapping_cache`) and, ideally,
+        `mni_ref_path`. If `mni_ref_path` is missing, a canonical MNI template
+        is resolved via `_resolve_mni_path`.
+    out_path : pathlib.Path
+        Output NIfTI path in MNI space (caller controls BIDS naming).
+
+    Returns
+    -------
+    pathlib.Path
+        `out_path` of the written MNI-space label (uint8/float-like array).
+
+    Files written
+    -------------
+    - Output NIfTI at `out_path` in space-MNI (nearest-neighbor resampling).
+
+    Assumptions / Preconditions
+    ---------------------------
+    - `xfm._mapping_cache` was created by `register_t1_to_mni` and matches the
+      T1 used to derive `src_to_t1_txt`.
+    - Nearest-neighbor interpolation is required to preserve label integrity.
+
+    Warnings
+    --------
+    - If the T1 used in `src_to_t1_txt` does not match the T1 used for the
+      T1↔MNI mapping, label boundaries may be misaligned.
+
+    Raises
+    ------
+    RuntimeError
+        If `xfm._mapping_cache` is missing (indirectly via
+        `apply_affine_then_warp_to_mni`).
+    """
+    mni_ref = xfm.mni_ref_path if getattr(xfm, "mni_ref_path", None) else _resolve_mni_path()
+    return apply_affine_then_warp_to_mni(
+        image_path=image_path,
+        affine_txt=src_to_t1_txt,
+        mapping=xfm._mapping_cache,
+        mni_path=mni_ref,
+        out_path=out_path,
+        is_label=True,   # nearest
+    )
+
+
+# --- NEW: warp subject T1 → MNI (once), then compute reusable brain mask ---
+
+def warp_t1_to_mni_once(
+    sp: SubjectPaths,
+    xfm: TransformBook,
+    *,
+    t1_path: Path | None = None,
+    overwrite: bool = False,
+) -> Path:
+    """
+    Warp subject T1 to MNI (linear) for a reusable subject-level MNI brain mask.
+
+    Parameters
+    ----------
+    sp : SubjectPaths
+        Subject-scoped paths helper (expects `sub` or `subQ`, `anat_out`).
+    xfm : TransformBook
+        Must carry a valid T1↔MNI mapping (`_mapping_cache`) and MNI reference
+        path (`mni_ref_path`) as produced by `estimate_and_save_core_transforms`.
+    t1_path : pathlib.Path or None, optional
+        T1 image to warp. If None, callers should pass the same denoised T1
+        that was used for registration; the function assumes an existing path.
+    overwrite : bool, optional
+        If False (default), return an existing MNI-space T1 if present.
+
+    Returns
+    -------
+    pathlib.Path
+        Path to `sub-<ID>_space-MNI_desc-T1w_in-MNI_map.nii.gz`.
+
+    Files written
+    -------------
+    - derivatives/neurofluid-mreg/sub-<ID>/anat/
+      sub-<ID>_space-MNI_desc-T1w_in-MNI_map.nii.gz
+
+    Assumptions / Preconditions
+    ---------------------------
+    - `xfm._mapping_cache` and `xfm.mni_ref_path` were created beforehand via
+      `estimate_and_save_core_transforms` and correspond to `t1_path`.
+    - Linear interpolation is sufficient for deriving a subject-level brain
+      mask or similar scalar maps.
+
+    Raises
+    ------
+    FileNotFoundError
+        If `t1_path` does not exist.
+    RuntimeError
+        If the T1↔MNI mapping is missing in `xfm`.
+
+    Notes
+    -----
+    - This helper is designed to be called once per subject; downstream code
+      can re-use the saved T1-in-MNI map to derive masks or QC overlays.
+    """
+    # Use the same subject ID convention you use elsewhere; adjust if you really need subQ
+    sub = getattr(sp, "subQ", None) or sp.sub
+
+    anat_out = Path(sp.anat_out)
+    anat_out.mkdir(parents=True, exist_ok=True)
+
+    # If caller explicitly supplied a T1, trust it (and validate)
+    t1_path = Path(t1_path)
+    if not t1_path.exists():
+        raise FileNotFoundError(f"[mask] Provided T1 path does not exist: {t1_path}")
+
+    out_t1_mni = anat_out / f"{sub}_space-MNI_desc-T1w_in-MNI_map.nii.gz"
+    if out_t1_mni.exists() and not overwrite:
+        return out_t1_mni
+
+    mapping = getattr(xfm, "_mapping_cache", None)
+    if mapping is None:
+        raise RuntimeError(
+            "[mask] T1↔MNI mapping missing. Run estimate_and_save_core_transforms first."
+        )
+
+    # Load and warp
+    t1_img = nib.load(str(t1_path))
+    t1_dat = t1_img.get_fdata().astype(np.float32)
+
+    # Transform into MNI space
+    t1_mni = mapping.transform(t1_dat, interpolation="linear")
+
+    # Get MNI reference
+    mni_ref_path = getattr(xfm, "mni_ref_path", None)
+    if mni_ref_path is None:
+        mni_ref_path = _resolve_mni_path()
+    mni_ref = nib.load(str(mni_ref_path))
+
+    nib.save(
+        nib.Nifti1Image(t1_mni, mni_ref.affine, mni_ref.header),
+        str(out_t1_mni),
+    )
+    print(f"[mask] Saved subject T1 in MNI → {out_t1_mni}")
+    return out_t1_mni
