@@ -15,14 +15,14 @@ Pipeline steps
 --------------
 1. Affine registration: SOURCE → T1 (DIPY, MI; translation → rigid → affine).
 2. Nonlinear registration: T1 → MNI (DIPY SyN, CC; optional).
-3. Resampling helpers: apply affine to a reference grid; compose affine+warp.
+3. Resampling helpers: apply affine (auto world/voxel detection) to a reference grid; compose affine+warp.
 4. Bookkeeping: save/read transform files; chain/invert; label-safe warps.
 
 Inputs / Outputs
 ----------------
 Inputs  : NIfTI volumes in native spaces (TOF/MRV/hT2w), T1, MREG mean; optional MNI.
-Outputs : Transform text files (.txt, 4×4), warp fields (NIfTI, vector fields),
-          and resampled image/label NIfTI as requested by callers.
+Outputs : Transform text files (.txt, 4×4),Matrices may be in world→world or voxel→voxel space; functions auto–normalize.
+          warp fields (NIfTI, vector fields),and resampled image/label NIfTI as requested by callers.
 
 Files written
 -------------
@@ -38,7 +38,8 @@ Files written
 Assumptions / Preconditions
 ---------------------------
 - Spaces: inputs are in their native spaces (TOF/MRV/hT2w/MREG) or T1; MNI is
-  resolved to MNI152 1 mm when needed. Affines define geometry consistently.
+  resolved to MNI152 1 mm when needed. Affines may be world→world or voxel→voxel; 
+  functions pick the correct convention by center-matching in world space.
 - Shapes/dtypes: images are float32/float64 on load; outputs are float32 unless
   a label is requested (nearest resampling downstream).
 - BIDS naming: filenames follow `sub-<ID>_space-<SPACE>_class-<CLASS>_desc-<DESC>_<SUFFIX>.nii.gz`
@@ -49,6 +50,8 @@ Warnings
 - If a requested MNI template is unavailable, nonlinear registration is skipped
   gracefully and only affine outputs are produced.
 - Resampling outside FOV returns zeros; labels are resampled with nearest-neighbor.
+- If affine matrices use an unexpected convention, the module selects the closest 
+  valid interpretation (world or voxel) based on center alignment.
 
 Public API
 ----------
@@ -562,8 +565,6 @@ def apply_affine_to_ref(
       purely to encode the chosen transform for resampling; the final output
       geometry is taken from the reference image.
     """
-    import numpy as np, nibabel as nib
-    from nibabel.processing import resample_from_to
 
     # --- load moving & reference ---
     mov = nib.load(str(image_path))
@@ -673,9 +674,7 @@ def apply_affine_then_warp_to_mni(
     - Output data live on the MNI grid defined by `mni_path`, and the output
       header is taken directly from the MNI template.
     """
-    import numpy as np, nibabel as nib
-    from nibabel.processing import resample_from_to
-
+    
     mov = nib.load(str(image_path))
     mni = nib.load(str(mni_path))
 
