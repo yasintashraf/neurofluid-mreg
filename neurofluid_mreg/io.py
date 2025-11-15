@@ -111,7 +111,7 @@ class SubjectPaths:
 
     Optional (config)
     -----------------
-    - anat: `inv1`, `inv2`, `mrv`, `ht2w`
+    - anat: `inv1`, `inv2`, `mrv`, `hT2w`
       → Attributes: `anat_inv1`, `anat_inv2`, `anat_mrv`, `anat_heavy_t2w`.
 
     Derived folders (under derivatives root)
@@ -152,7 +152,7 @@ class SubjectPaths:
         self.anat_inv1 = _resolve_under(self.anat_dir, a.get("inv1"))
         self.anat_inv2 = _resolve_under(self.anat_dir, a.get("inv2"))
         self.anat_mrv = _resolve_under(self.anat_dir, a.get("mrv"))
-        self.anat_heavy_t2w = _resolve_under(self.anat_dir, a.get("ht2w"))
+        self.anat_heavy_t2w = _resolve_under(self.anat_dir, a.get("hT2w"))
 
         # Resolve func file (explicit)
         f = self.cfg.func or {}
@@ -191,7 +191,7 @@ def validate_required_inputs(sp: SubjectPaths) -> None:
     - `anat_inv1` (INV1)
     - `anat_inv2` (INV2)
     - `anat_mrv`  (MRV)
-    - `anat_heavy_t2w` (HT2w)
+    - `anat_heavy_t2w` (hT2w)
 
     Parameters
     ----------
@@ -224,7 +224,7 @@ def validate_required_inputs(sp: SubjectPaths) -> None:
         ("INV1", sp.anat_inv1),
         ("INV2", sp.anat_inv2),
         ("MRV", sp.anat_mrv),
-        ("HT2w", sp.anat_heavy_t2w),
+        ("hT2w", sp.anat_heavy_t2w),
     ]:
         if p and not Path(p).exists():
             print(f"[WARN] Optional file not found -> {label}: {p}")

@@ -52,7 +52,7 @@ Warnings
 - If input filenames lack `space-*`, wrappers still enforce the correct space
   token via `space_override` when constructing outputs.
 - QC PNG writing in `veins_mrv` requires matplotlib and writes to `out_dir/qc/`.
-- If `use_epc=True` but `t1_path` is missing/invalid, `pvs_ht2w` falls back to
+- If `use_epc=True` but `t1_path` is missing/invalid, `pvs_hT2w` falls back to
   the hT2w driver and continues.
 - EPC and small-scale Frangi may shift contrast; downstream thresholds may need
   retuning. Preprocessing uses robust percentile windowing and may clip tails.
@@ -64,7 +64,7 @@ Public API
 ----------
 - arteries_tof
 - veins_mrv
-- pvs_ht2w
+- pvs_hT2w
 """
 
 import re
@@ -84,8 +84,8 @@ from .helper_seg import (
     iterative_hysteresis,
     preprocess_mrv_for_vesselness,
     intensity_gate,
-    pvs_preprocess_ht2w,
-    epc_from_t1_and_ht2w,
+    pvs_preprocess_hT2w,
+    epc_from_t1_and_hT2w,
     segment_pvs_frangi3d
 )
 from skimage.morphology import (
@@ -653,8 +653,8 @@ def veins_mrv(
     }
 
 
-def pvs_ht2w(
-    ht2w_nii: Path,
+def pvs_hT2w(
+    hT2w_nii: Path,
     out_dir: Path,
     *,
     use_epc: bool = False,                 
@@ -679,7 +679,7 @@ def pvs_ht2w(
 
     Parameters
     ----------
-    ht2w_nii : pathlib.Path
+    hT2w_nii : pathlib.Path
         Native-space heavy-T2w NIfTI path (moving/driver is resampled nowhere;
         outputs preserve this grid/affine).
     out_dir : pathlib.Path
@@ -747,19 +747,19 @@ def pvs_ht2w(
     - PVS parameters and the EPC path are **provisional** and may be revised in
       future releases; keep `write_*_artifacts=True` for QC while iterating.
     """
-    print(f"[pvs] Input found → {ht2w_nii.name}")
+    print(f"[pvs] Input found → {hT2w_nii.name}")
  
  
     vesselness_file, skeleton_file, mask_file = make_output_paths(
-    ht2w_nii, out_dir, class_name="pvs", space_override="hT2w")
+    hT2w_nii, out_dir, class_name="pvs", space_override="hT2w")
 
     # Compute expected outputs early and skip if present    
     if (not overwrite) and all(p.exists() for p in (vesselness_file, skeleton_file, mask_file)):
         print("[pvs] [SKIP] outputs exist (use overwrite=True to recompute)")
         return {"vesselness": vesselness_file, "skeleton": skeleton_file, "mask": mask_file}
  
-    pre_img, pre_mask, affine, header = pvs_preprocess_ht2w(
-        ht2w_nii,
+    pre_img, pre_mask, affine, header = pvs_preprocess_hT2w(
+        hT2w_nii,
         clip_low=1.0,
         clip_high=99.0,
         thr_low=0.15,
@@ -785,7 +785,7 @@ def pvs_ht2w(
             epc_dir.mkdir(parents=True, exist_ok=True)
 
             # BIDS-like stem
-            txt = str(ht2w_nii)
+            txt = str(hT2w_nii)
             m_sub = re.search(r"(sub-[A-Za-z0-9]+)", txt)
             m_ses = re.search(r"(ses-[A-Za-z0-9]+)", txt)
             stem_parts = []
@@ -797,10 +797,10 @@ def pvs_ht2w(
             xfm_out = epc_dir / f"{stem}from-T1_to-hT2w_mode-affine_xfm.txt"
 
             # Build EPC (register T1→hT2w inside; light T1 preprocess as needed)
-            epc_img = epc_from_t1_and_ht2w(
+            epc_img = epc_from_t1_and_hT2w(
                 t1_path=Path(t1_path),
-                ht2w_arr=pre_img,            # already [0,1]
-                ht2w_aff=affine,
+                hT2w_arr=pre_img,            # already [0,1]
+                hT2w_aff=affine,
                 out_fused_path=(epc_out if write_epc_artifacts else None),
                 out_xfm_path=(xfm_out if write_epc_artifacts else None),
                 do_n4=bool(t1_do_n4),        # this is ONLY for T1; fine to keep

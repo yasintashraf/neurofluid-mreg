@@ -72,7 +72,7 @@ class PipelineConfig:
         Root directory for BIDS-derivatives outputs.
     anat : dict[str, str | None], optional
         Modality hints/overrides for anatomical inputs (e.g., T1, TOF, MRV,
-        HT2w). Values are absolute/relative paths, or None to auto-discover.
+        hT2w). Values are absolute/relative paths, or None to auto-discover.
     func : dict[str, str | None], optional
         Functional/MREG input hints. Values are paths or None to auto-discover.
     bands : dict[str, list[Number]] | None

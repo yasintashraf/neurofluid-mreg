@@ -18,7 +18,7 @@
 #   anat.inv1 : MP2RAGE INV1 (optional; enables MP2RAGE denoise)
 #   anat.inv2 : MP2RAGE INV2 (optional; enables MP2RAGE denoise)
 #   anat.mrv  : Venography / GRE/SWI magnitude (optional; enables veins branch)
-#   anat.ht2w : Heavy T2w (optional; enables PVS branch)
+#   anat.hT2w : Heavy T2w (optional; enables PVS branch)
 #   func.mreg : 4D MREG BOLD (required)
 #
 # Path resolution
@@ -104,8 +104,8 @@ anat:
   tof:  "xh33_x107_ToF400_wb_cs6_noFC_20250314090142_22.nii.gz"         # REQUIRED
   inv1: "xh33_x107_hm_fg_mp2_0p7_cs4_6000_20250314090142_11.nii.gz"     # optional
   inv2: "xh33_x107_hm_fg_mp2_0p7_cs4_6000_20250314090142_12.nii.gz"     # optional
-#  mrv:  "xh33_x107_dzne_ep3d_uhr_0p5iso_tra_3TE_20250314090142_25_e3.nii.gz"
-#  ht2w: "xh33_x107_hT2w_spc_fast_TR3000_20250314090142_16.nii.gz"
+  mrv:  "xh33_x107_dzne_ep3d_uhr_0p5iso_tra_3TE_20250314090142_25_e3.nii.gz"
+  hT2w: "xh33_x107_hT2w_spc_fast_TR3000_20250314090142_16.nii.gz"
 
 func:
   mreg: "xh33_x107_hm_ep2d_mreg_3p0_12_200_20250314090142_18.nii.gz"   # REQUIRED

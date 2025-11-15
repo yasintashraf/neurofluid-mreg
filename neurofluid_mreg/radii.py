@@ -92,7 +92,7 @@ _NATIVE_SPACE = {"arteries": "TOF", "veins": "MRV", "pvs": "hT2W"}
 _CLASS_TO_SPACE_AND_IMG = {
     "arteries": ("TOF", "anat_tof"),
     "veins": ("MRV", "anat_mrv"),
-    "pvs": ("hT2W", "anat_heavy_t2w"),
+    "pvs": ("hT2w", "anat_heavy_t2w"),
 }
 
 

@@ -80,7 +80,7 @@ from .transforms import TransformBook
 _CLASS_TO_NATIVE = {
     "arteries": ("TOF", "tof_to_t1"),
     "veins": ("MRV", "mrv_to_t1"),
-    "pvs": ("HT2W", "ht2w_to_t1"),
+    "pvs": ("hT2w", "hT2w_to_t1"),
 }
 
 # -------------------------------------------------------------
@@ -197,7 +197,7 @@ def distance_map_native_to_mni(
                 interpolation="nearest",
             )
         except RuntimeError as e:
-            # e.g. Missing affine 'mrv_to_t1' / 'ht2w_to_t1' when MRV/HT2w not present
+            # e.g. Missing affine 'mrv_to_t1' / 'ht2w_to_t1' when MRV/hT2w not present
             if "Missing affine" in str(e):
                 print(
                     f"[dist→mni] [SKIP] No transform for {klass} "
@@ -299,7 +299,6 @@ def generate_distance_maps_mni(
     Warnings
     --------
     - Units are assumed to be millimeters derived from the MNI header zooms;
-      verify this assumption before interpreting distance-bin definitions.
     - If no native masks are found or all distance maps are already up to
       date (and `overwrite` is False), the returned dictionary may be empty
       and a summary message is printed.

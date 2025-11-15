@@ -7,7 +7,7 @@ transforms.py
 Unified registration and resampling utilities for Neurofluid–MREG.
 
 This module provides small, deterministic helpers to estimate affine/nonlinear
-transforms among native modalities (TOF/MRV/HT2w), T1, and MNI, and to apply
+transforms among native modalities (TOF/MRV/hT2w), T1, and MNI, and to apply
 those transforms for image/label resampling. It also includes a lightweight
 bookkeeping class (`TransformBook`) and a minimal wrapper to denoise MP2RAGE.
 
@@ -20,7 +20,7 @@ Pipeline steps
 
 Inputs / Outputs
 ----------------
-Inputs  : NIfTI volumes in native spaces (TOF/MRV/HT2w), T1, MREG mean; optional MNI.
+Inputs  : NIfTI volumes in native spaces (TOF/MRV/hT2w), T1, MREG mean; optional MNI.
 Outputs : Transform text files (.txt, 4×4), warp fields (NIfTI, vector fields),
           and resampled image/label NIfTI as requested by callers.
 
@@ -37,7 +37,7 @@ Files written
 
 Assumptions / Preconditions
 ---------------------------
-- Spaces: inputs are in their native spaces (TOF/MRV/HT2w/MREG) or T1; MNI is
+- Spaces: inputs are in their native spaces (TOF/MRV/hT2w/MREG) or T1; MNI is
   resolved to MNI152 1 mm when needed. Affines define geometry consistently.
 - Shapes/dtypes: images are float32/float64 on load; outputs are float32 unless
   a label is requested (nearest resampling downstream).
@@ -52,7 +52,7 @@ Warnings
 
 Public API
 ----------
-- register_t1_to_ht2w
+- register_t1_to_hT2w
 - register_to_t1
 - register_t1_to_mni
 - apply_affine_to_ref
@@ -160,7 +160,7 @@ def _resolve_mni_path() -> Path:
 # -------------------------------------------------------------
 # Core registration functions
 # -------------------------------------------------------------
-def register_t1_to_ht2w(
+def register_t1_to_hT2w(
     moving: np.ndarray, moving_aff: np.ndarray,
     static: np.ndarray, static_aff: np.ndarray,
     *,
@@ -201,7 +201,7 @@ def register_t1_to_ht2w(
     Files written
     -------------
     - None (returns arrays only; caller may save to
-      `sub-<ID>_space-HT2W_class-T1_desc-registered_map.nii.gz`).
+      `sub-<ID>_space-hT2w_class-T1_desc-registered_map.nii.gz`).
 
     Assumptions / Preconditions
     ---------------------------
@@ -222,13 +222,13 @@ def register_t1_to_ht2w(
     Notes
     -----
     - Uses DIPY’s mutual-information metric with three-level pyramid.
-    - Typical runtime: 1–3 min (depends on image size and `use_nonlin` flag).
+    - Typical runtime: 10–30 min (depends on image size and `use_nonlin` flag).
     """
 
     com = transform_centers_of_mass(static, static_aff, moving, moving_aff)
 
     metric = MutualInformationMetric(nbins=mi_bins, sampling_proportion=0.3)
-    level_iters = [1,1,1]#[1000, 100, 10]  # tuned elsewhere; logic unchanged
+    level_iters = [1000, 100, 10]  # tuned elsewhere; logic unchanged
     sigmas = [3.0, 1.0, 0.0]
     factors = [4, 2, 1]
     affreg = AffineRegistration(
@@ -300,7 +300,7 @@ def register_to_t1(
     Parameters
     ----------
     src_img_path : pathlib.Path
-        Moving image (TOF/MRV/HT2w/MREG). If 4D and `allow_4d_mean=True`,
+        Moving image (TOF/MRV/hT2w/MREG). If 4D and `allow_4d_mean=True`,
         the temporal mean is used.
     ref_t1_path : pathlib.Path
         Fixed T1 image (denoised MP2RAGE recommended).
@@ -309,7 +309,7 @@ def register_to_t1(
     sub_id : str
         Subject identifier including `sub-` prefix.
     modality_tag : str
-        Token for filename tag (e.g., "TOF", "MRV", "HT2w", "MREG").
+        Token for filename tag (e.g., "TOF", "MRV", "hT2w", "MREG").
     allow_4d_mean : bool, default=True
         If True and `src_img_path` is 4D, average over time before registration.
 
@@ -331,6 +331,11 @@ def register_to_t1(
     ------
     ValueError
         If a 4D source is provided and `allow_4d_mean=False`.
+
+    Notes
+    -----
+    - The saved 4×4 is a world→world affine (mm) returned by DIPY’s optimizer.
+    -  Downstream resampling always forces the output to the requested reference grid.    
     """
     out_dir = Path(out_dir)
     _ensure_dir(out_dir)
@@ -356,7 +361,7 @@ def register_to_t1(
     mi = MutualInformationMetric(nbins=32, sampling_proportion=None)
 
     # Multires pyramid
-    level_iters = [1,1,1] #[1000, 100, 10]  # tuned elsewhere; logic unchanged
+    level_iters = [1000, 100, 10]  # tuned elsewhere; logic unchanged
     sigmas = [3.0, 1.0, 0.0]
     factors = [4, 2, 1]
 
@@ -456,7 +461,7 @@ def register_t1_to_mni(
 
     # 2) short rigid MI optimization (handles rotation/scale better than COM alone)
     mi = MutualInformationMetric(nbins=32)
-    level_iters =[1,1,1]# [1000, 100, 10]
+    level_iters = [1000, 100, 10]
     affreg = AffineRegistration(metric=mi, level_iters=level_iters)
     print(f"[xfm] Pre-rigid pyramid (T1→MNI): iters={level_iters}")
     rigid = RigidTransform3D()
@@ -508,20 +513,32 @@ def apply_affine_to_ref(
     interpolation: str = "linear",  # "linear" for images, "nearest" for labels
 ) -> Path:
     """
-    Apply a 4×4 affine and resample an image onto a reference grid.
+    Apply a 4×4 transform and resample a moving image onto a reference grid.
+
+    This implementation uses `nibabel.processing.resample_from_to` and
+    automatically disambiguates whether the 4×4 matrix is given in
+    world→world or voxel→voxel (index→index) coordinates, choosing the
+    convention that best aligns the image centers in world space.
 
     Parameters
     ----------
     image_path : pathlib.Path
         Moving image path (3D or 4D).
     affine : pathlib.Path or ndarray, shape (4, 4)
-        Affine (moving→reference). If path, text file readable via `np.loadtxt`.
+        4×4 transform relating the moving and reference images.
+        If a path, the matrix is loaded via `_load_affine_txt`.
+        The matrix may be:
+        - world→world (moving→reference), or
+        - voxel→voxel (moving indices→reference indices),
+        and the function will pick the interpretation that maps the moving
+        image center closest to the reference center in world coordinates.
     ref_img_path : pathlib.Path
-        Reference image (target geometry; 3D grid is used).
+        Reference image defining the target grid (shape and affine).
     out_path : pathlib.Path
         Output NIfTI path.
     interpolation : {"linear", "nearest"}, default="linear"
-        Interpolation mode; use "nearest" for labels.
+        Interpolation mode used by `resample_from_to`;
+        use `"nearest"` for label images.
 
     Returns
     -------
@@ -530,51 +547,58 @@ def apply_affine_to_ref(
 
     Files written
     -------------
-    - Output NIfTI at `out_path` (space/desc/suffix chosen by caller).
+    - Output NIfTI at `out_path` with:
+      - data resampled onto `ref_img_path`'s grid, and
+      - affine equal to the reference image affine.
 
     Assumptions / Preconditions
     ---------------------------
-    - For 4D inputs, the same affine is applied frame-wise.
-    - Operates in image space defined by affines; no header edits beyond write.
+    - The 4×4 transform is either world→world or voxel→voxel between the
+      moving and reference images; other conventions are not handled.
+    - For 4D inputs, all volumes are resampled with the same spatial
+      transform (handled internally by `resample_from_to`).
+    - Data are cast to float32 before resampling.
+    - The moving header is reused with an updated affine (`A_best @ mov.affine`)
+      purely to encode the chosen transform for resampling; the final output
+      geometry is taken from the reference image.
     """
+    import numpy as np, nibabel as nib
+    from nibabel.processing import resample_from_to
 
-    # --- load moving & reference images ---
-    img = nib.load(str(image_path))
-    data = img.get_fdata().astype(np.float32, copy=False)
-
+    # --- load moving & reference ---
+    mov = nib.load(str(image_path))
     ref = nib.load(str(ref_img_path))
-    ref_shape_3d = ref.shape[:3]  # ensure 3D grid for codomain
 
-    # --- resolve affine ---
-    if isinstance(affine, (str, Path)):
-        A = _load_affine_txt(Path(affine))     # uses np.loadtxt(str(...))
-    else:
-        A = np.asarray(affine, dtype=np.float32)
-        if A.shape != (4, 4):
-            raise ValueError(f"affine must be 4x4, got {A.shape}")
+    # --- load 4x4 ---
+    A = _load_affine_txt(Path(affine)) if isinstance(affine, (str, Path)) else np.asarray(affine, dtype=np.float32)
+    if A.shape != (4, 4):
+        raise ValueError(f"affine must be 4x4, got {A.shape}")
 
-    # --- build mapper (moving -> reference) ---
-    amap = AffineMap(
-        A,
-        domain_grid_shape=img.shape[:3],
-        domain_grid2world=img.affine,
-        codomain_grid_shape=ref_shape_3d,
-        codomain_grid2world=ref.affine,
-    )
+    # --- build both interpretations, pick the one that maps centers best ---
+    def center_world(img):
+        i, j, k = (np.array(img.shape[:3]) - 1) / 2.0
+        return img.affine @ np.array([i, j, k, 1.0])
 
-    # --- resample ---
-    if data.ndim == 3:
-        res = amap.transform(data, interpolation=interpolation)
-        nib.save(nib.Nifti1Image(res.astype(np.float32, copy=False), ref.affine), str(out_path))
-        print(f"[xfm] Saved → {out_path}")
-    else:
-        nt = data.shape[3]
-        out = np.empty(ref_shape_3d + (nt,), dtype=np.float32)
-        print(f"[xfm] 4D input detected; applying affine frame-wise (nt={nt})")
-        for t in range(nt):
-            out[..., t] = amap.transform(data[..., t], interpolation=interpolation)
-        nib.save(nib.Nifti1Image(out, ref.affine), str(out_path))
-        print(f"[xfm] Saved → {out_path}")
+    c_mov = center_world(mov)[:3]
+    c_ref = center_world(ref)[:3]
+
+    # Option A: txt is world->world
+    A_world = A
+    dA = np.linalg.norm((A_world @ np.append(c_mov, 1))[:3] - c_ref)
+
+    # Option B: txt is voxel->voxel  (convert to world->world)
+    A_vox2world = ref.affine @ A @ np.linalg.inv(mov.affine)
+    dB = np.linalg.norm((A_vox2world @ np.append(c_mov, 1))[:3] - c_ref)
+
+    A_best = A_world if dA <= dB else A_vox2world
+
+    # --- embed A_best into moving header, then force-resample onto ref grid ---
+    order = 0 if interpolation == "nearest" else 1
+    mov_prime = nib.Nifti1Image(mov.get_fdata().astype("float32"), A_best @ mov.affine, mov.header)
+    out_img = resample_from_to(mov_prime, (ref.shape, ref.affine), order=order)
+
+    nib.save(out_img, str(out_path))
+    print(f"[xfm] Saved → {out_path}")
     return Path(out_path)
 
 def apply_affine_then_warp_to_mni(
@@ -584,26 +608,45 @@ def apply_affine_then_warp_to_mni(
     mni_path: Path,
     out_path: Path,
     *,
-
     is_label: bool = False,
 ) -> Path:
     """
-    Compose (src→T1 affine) with (T1→MNI warp) and resample to MNI.
+    Apply a src→T1 affine and a T1→MNI nonlinear warp, and resample to MNI space.
+
+    The 4×4 affine is automatically interpreted as either world→world or
+    voxel→voxel (index→index) between the moving image and the T1 grid used
+    to estimate the warp. The selected interpretation is the one that maps
+    the moving image center closest to the T1 center in world space. The
+    image is first resampled onto the T1 grid using
+    `nibabel.processing.resample_from_to`, then warped to MNI using the
+    provided `DiffeomorphicMap`.
 
     Parameters
     ----------
     image_path : pathlib.Path
         Moving image path (3D or 4D).
     affine_txt : pathlib.Path
-        4×4 affine text file (src→T1).
+        4×4 transform text file relating the moving image to the T1 grid.
+        The matrix may be:
+        - world→world (moving→T1), or
+        - voxel→voxel (moving indices→T1 indices).
+        The function tries both interpretations and chooses the one that
+        aligns the moving and T1 centers best in world coordinates.
     mapping : DiffeomorphicMap
-        T1→MNI map returned by `register_t1_to_mni`.
+        T1→MNI nonlinear warp. Must expose:
+        - `domain_shape`       : T1 grid shape (3D),
+        - `domain_grid2world`  : T1 grid→world affine,
+        and a `.transform(data, interpolation=...)` method that maps data on
+        the T1 grid into MNI space.
     mni_path : pathlib.Path
-        MNI template (target geometry).
+        MNI template image; its grid (shape+affine) and header are used for
+        the output.
     out_path : pathlib.Path
         Output NIfTI path.
     is_label : bool, default=False
-        If True, use nearest-neighbor at both steps.
+        If True, use nearest-neighbor interpolation at both the affine
+        (resample_to_T1) and nonlinear (T1→MNI) steps. If False, use linear
+        interpolation for both.
 
     Returns
     -------
@@ -612,53 +655,65 @@ def apply_affine_then_warp_to_mni(
 
     Files written
     -------------
-    - Output NIfTI at `out_path` in space-MNI (suffix chosen by caller).
+    - Output NIfTI at `out_path` in MNI space, using:
+      - the MNI template grid and affine, and
+      - the MNI template header (copied from `mni_path`).
 
     Assumptions / Preconditions
     ---------------------------
-    - For 4D, frames are resampled independently.
-    - Operates in image space; geometry pulled to T1 then warped to MNI.
+    - `affine_txt` encodes a valid 4×4 transform between the moving image
+      and the T1 grid used as the warp domain, either in world→world or
+      voxel→voxel convention.
+    - `mapping.domain_shape` and `mapping.domain_grid2world` correspond to
+      the T1 grid on which the warp was estimated.
+    - For 4D inputs, the spatial transform is the same for all volumes; the
+      affine resampling is handled by `resample_from_to`, and the nonlinear
+      warp is applied to the full 3D/4D array.
+    - Data are cast to float32 before resampling/warping.
+    - Output data live on the MNI grid defined by `mni_path`, and the output
+      header is taken directly from the MNI template.
     """
+    import numpy as np, nibabel as nib
+    from nibabel.processing import resample_from_to
 
-    img = nib.load(str(image_path))
-    data = img.get_fdata().astype(np.float32)
+    mov = nib.load(str(image_path))
     mni = nib.load(str(mni_path))
 
-    interp_img = "nearest" if is_label else "linear"
-    from dipy.align.imaffine import AffineMap
+    # mapping.domain_* = T1 grid used to ESTIMATE the warp
+    t1_shape = mapping.domain_shape
+    t1_aff   = mapping.domain_grid2world
 
+    # ---- load and normalize affine to WORLD->WORLD (same trick as above) ----
     A = _load_affine_txt(affine_txt)
-    # First, affine-resample onto T1 grid by pulling data into T1 geometry.
-    # For simplicity, we directly compose by transforming data in world coords.
-    # We resample to MNI in the second step via the mapping.
 
-    if data.ndim == 3:
-        # Affine to T1 space (using T1 geometry implicit in mapping.moving_grid2world)
-        t1_shape = mapping.domain_shape
-        t1_aff   = mapping.domain_grid2world
-        amap = AffineMap( A, domain_grid_shape=img.shape[:3],
-                         domain_grid2world=img.affine, codomain_grid_shape=t1_shape,
-                         codomain_grid2world=t1_aff, )
-        data_t1 = amap.transform(data, interpolation=interp_img)
-        # Nonlinear to MNI
-        data_mni = mapping.transform(data_t1, interpolation=interp_img)
-        nib.save(nib.Nifti1Image(data_mni.astype(np.float32), mni.affine), str(out_path))
-        print(f"[xfm] Saved → {out_path}")
-    else:
-        nt = data.shape[3]
-        out = np.zeros(mni.shape + (nt,), dtype=np.float32)
-        t1_shape = mapping.domain_shape
-        t1_aff   = mapping.domain_grid2world
-        amap = AffineMap( A, domain_grid_shape=img.shape[:3],
-                         domain_grid2world=img.affine, codomain_grid_shape=t1_shape,
-                         codomain_grid2world=t1_aff, )
-        for t in range(nt):
-            frame_t1 = amap.transform(data[..., t], interpolation=interp_img)
-            out[..., t] = mapping.transform(frame_t1, interpolation=interp_img)
-        nib.save(nib.Nifti1Image(out, mni.affine), str(out_path))
-        print(f"[xfm] Saved → {out_path}")
+    def center_world(shape, aff):
+        i, j, k = (np.array(shape) - 1) / 2.0
+        return aff @ np.array([i, j, k, 1.0])
+
+    c_mov = center_world(mov.shape[:3], mov.affine)[:3]
+    c_t1  = center_world(t1_shape,        t1_aff)[:3]
+
+    A_world = A
+    dA = np.linalg.norm((A_world @ np.append(c_mov, 1))[:3] - c_t1)
+    A_vox2world = t1_aff @ A @ np.linalg.inv(mov.affine)
+    dB = np.linalg.norm((A_vox2world @ np.append(c_mov, 1))[:3] - c_t1)
+    A_best = A_world if dA <= dB else A_vox2world
+
+    # ---- Step 1: embed A_best and resample onto the T1 grid (the warp domain) ----
+    order = 0 if is_label else 1
+    mov_prime = nib.Nifti1Image(mov.get_fdata().astype("float32"), A_best @ mov.affine, mov.header)
+    # Use a tuple (shape, affine) so we don't need a real T1 file here
+    mov_in_t1 = resample_from_to(mov_prime, (t1_shape, t1_aff), order=order)
+
+    # ---- Step 2: apply nonlinear T1->MNI warp on the T1-grid data ----
+    data_t1  = mov_in_t1.get_fdata().astype("float32")
+    data_mni = mapping.transform(data_t1, interpolation="nearest" if is_label else "linear")
+
+    # ---- Save with the exact MNI header (affine+header) ----
+    out_img = nib.Nifti1Image(data_mni.astype("float32"), mni.affine, mni.header)
+    nib.save(out_img, str(out_path))
+    print(f"[xfm] Saved → {out_path}")
     return Path(out_path)
-
 
 # -------------------------------------------------------------
 # Transform bookkeeping (compose chains, inversion, etc.)
@@ -705,7 +760,7 @@ class TransformBook:
         Saved artifacts keyed by:
         - 'tof_to_t1'            : 4×4 txt
         - 'mrv_to_t1'            : 4×4 txt (if MRV provided)
-        - 'ht2w_to_t1'           : 4×4 txt (if HT2w provided)
+        - 'hT2w_to_t1'           : 4×4 txt (if hT2w provided)
         - 'mregmean_to_t1'       : 4×4 txt
         - 't1_to_mni_warp'       : NIfTI (vector field; if MNI available)
         - 'mni_to_t1_warp'       : NIfTI (vector field; if MNI available)
@@ -738,11 +793,11 @@ class TransformBook:
         mreg_mean_path: Path,
         *,
         mrv_path: Optional[Path] = None,
-        ht2w_path: Optional[Path] = None,
+        hT2w_path: Optional[Path] = None,
         mni_path: Optional[Path] = None,
     ) -> None:
         """
-        Estimate TOF/MRV/HT2w/MREGMEAN → T1 affines; optionally T1 ↔ MNI warps.
+        Estimate TOF/MRV/hT2w/MREGMEAN → T1 affines; optionally T1 ↔ MNI warps.
 
         Parameters
         ----------
@@ -754,8 +809,8 @@ class TransformBook:
             Mean MREG (3D) for MREGMEAN→T1.
         mrv_path : pathlib.Path or None
             Optional MRV image for MRV→T1.
-        ht2w_path : pathlib.Path or None
-            Optional heavy-T2w image for HT2w→T1.
+        hT2w_path : pathlib.Path or None
+            Optional heavy-T2w image for hT2w→T1.
         mni_path : pathlib.Path or None
             Optional MNI path; if None, a template is resolved.
 
@@ -763,7 +818,7 @@ class TransformBook:
         -------------
         - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-TOFtoT1.txt
         - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-MRVtoT1.txt
-        - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-HT2wtoT1.txt
+        - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-hT2wtoT1.txt
         - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-MREGMEANtoT1.txt
         - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-T1toMNI_warp.nii.gz
         - derivatives/neurofluid-mreg/sub-<ID>/anat/sub-<ID>_xfm-MNItoT1_warp.nii.gz
@@ -789,10 +844,10 @@ class TransformBook:
                 sub_id=self.sp.sub, modality_tag="MRV"
             )
 
-        if ht2w_path is not None:
-            self.paths["ht2w_to_t1"] = register_to_t1(
-                ht2w_path, t1_denoised_path, Path(self.sp.transforms_dir),
-                sub_id=self.sp.sub, modality_tag="HT2w"
+        if hT2w_path is not None:
+            self.paths["hT2w_to_t1"] = register_to_t1(
+                hT2w_path, t1_denoised_path, Path(self.sp.transforms_dir),
+                sub_id=self.sp.sub, modality_tag="hT2w"
             )
 
         self.paths["mregmean_to_t1"] = register_to_t1(
@@ -888,7 +943,7 @@ class TransformBook:
                 Inverse T1↔MNI map → snap MNI labels to the requested T1 grid.
               - ("T1","MREG")
                 4×4 T1→MREG affine baked into header, then resampled to MREG.
-              - ("TOF","MNI"), ("MRV","MNI"), ("HT2w","MNI")
+              - ("TOF","MNI"), ("MRV","MNI"), ("hT2w","MNI")
                 Compose (src→T1 affine) with stored T1↔MNI warp via
                 `apply_affine_then_warp_to_mni` (nearest for labels, linear for
                 images depending on `interpolation`).
@@ -955,23 +1010,23 @@ class TransformBook:
             nib.save(out_img, out_path)
             return
         
-        if chain[1] == "MNI" and chain[0].upper() in ("TOF", "MRV", "hT2w"):
+        if chain[1] == "MNI" and chain[0] in ("TOF", "MRV", "hT2w"):
             if getattr(self, "_mapping_cache", None) is None or getattr(self, "mni_ref_path", None) is None:
                 raise RuntimeError("No T1↔MNI mapping cached. Did you skip T1→MNI registration?")
 
             # Normalize source token 
-            src_token = chain[0].upper()
+            src_token = chain[0]
             src_key_map = {
                 "TOF":  "tof_to_t1",
                 "MRV":  "mrv_to_t1",
-                "hT2w": "ht2w_to_t1",
+                "hT2w": "hT2w_to_t1",
             }
             src_key = src_key_map[src_token]
 
             try:
                 affine_txt = self.get(src_key)
             except KeyError:
-                # This is what you already see for missing MRV/HT2w affines
+                # This is what you already see for missing MRV/hT2w affines
                 raise RuntimeError(f"Missing affine '{src_key}'. Available: {list(self.paths.keys())}")
 
             # nearest => labels, linear => images
@@ -1001,7 +1056,7 @@ def warp_radii_to_mreg(
     overwrite: bool = False,
 ) -> dict[str, Path]:
     """
-    Warp native-space radius maps (TOF/MRV/HT2W) → MREG via T1.
+    Warp native-space radius maps (TOF/MRV/hT2w) → MREG via T1.
 
     Parameters
     ----------
@@ -1043,7 +1098,7 @@ def warp_radii_to_mreg(
     mapping = {
         "arteries": ("TOF",  "tof_to_t1"),
         "veins":    ("MRV",  "mrv_to_t1"),
-        "pvs":      ("HT2W", "ht2w_to_t1"),
+        "pvs":      ("hT2w", "hT2w_to_t1"),
     }
 
     def _apply_native_to_t1(native_img: Path, akey: str, out_t1_img: Path) -> Path:

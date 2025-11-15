@@ -11,7 +11,7 @@ details are implemented in their respective modules.
 
 Pipeline steps
 --------------
-1. Segmentation in native spaces (TOF/MRV/HT2w).
+1. Segmentation in native spaces (TOF/MRV/hT2w).
 2. MREG preprocessing (realign, detrend) and temporal mean.
 3. Core transforms (affine source→T1; optional SyN T1→MNI).
 4. Warp masks (and radii) to the MREG grid (optional MNI exports).
@@ -50,7 +50,7 @@ Warnings
 --------
 - TR is read from the MREG JSON sidecar by analysis routines (any `tr` argument
   is ignored and kept for compatibility).
-- Optional inputs (MRV/HT2w) are conditional; missing data are skipped with
+- Optional inputs (MRV/hT2w) are conditional; missing data are skipped with
   warnings upstream.
 - Most steps are idempotent and honor `overwrite`.
 
@@ -80,7 +80,7 @@ from neurofluid_mreg.masking import compute_mni_brain_mask_once #compute_t1_mask
 # -------------------------------------------------------------
 # Thresholding / post-processing / skeletonization (segmentation)
 # -------------------------------------------------------------
-from neurofluid_mreg.seg import arteries_tof, veins_mrv, pvs_ht2w
+from neurofluid_mreg.seg import arteries_tof, veins_mrv, pvs_hT2w
 
 # -------------------------------------------------------------
 # Radii estimation / fitting / QC
@@ -153,7 +153,7 @@ def main():
     ---------------------------
     - `pipeline.yaml` is present in the CWD and contains explicit filenames.
     - Required inputs exist (T1w, TOF, MREG); validated by `validate_required_inputs`.
-    - Optional steps (MRV/HT2w, radii, MNI) are executed only if configured and
+    - Optional steps (MRV/hT2w, radii, MNI) are executed only if configured and
       data are available.
 
     Warnings
@@ -188,9 +188,9 @@ def main():
         print("[veins] [SKIP] MRV not provided or missing")
 
     if sp.anat_heavy_t2w and Path(sp.anat_heavy_t2w).exists():
-        pvs_ht2w(Path(sp.anat_heavy_t2w), Path(sp.masks_dir), use_epc=False, t1_path=None, overwrite=False)
+        pvs_hT2w(Path(sp.anat_heavy_t2w), Path(sp.masks_dir), use_epc=False, t1_path=None, overwrite=False)
     else:
-        print("[pvs] [SKIP] HT2w/T2w not provided or missing")
+        print("[pvs] [SKIP] hT2w/T2w not provided or missing")
 
     # -----------------------------------
     # 2) MREG PREPROC (realign + detrend)
@@ -231,7 +231,7 @@ def main():
         tof_path=Path(sp.anat_tof),
         mreg_mean_path=mreg_mean_img,
         mrv_path=(Path(sp.anat_mrv) if sp.anat_mrv and Path(sp.anat_mrv).exists() else None),
-        ht2w_path=(Path(sp.anat_heavy_t2w) if sp.anat_heavy_t2w and Path(sp.anat_heavy_t2w).exists() else None),
+        hT2w_path=(Path(sp.anat_heavy_t2w) if sp.anat_heavy_t2w and Path(sp.anat_heavy_t2w).exists() else None),
         mni_path=None,
     )
 

@@ -46,7 +46,7 @@ Warnings
 Public API
 ----------
 - load_nifti, save_nifti, make_output_paths
-- preprocess_mrv_for_vesselness, pvs_preprocess_ht2w
+- preprocess_mrv_for_vesselness, pvs_preprocess_hT2w
 - combine_echoes_te_weighted, compute_r2star_map
 - frangi_vesselness, segment_pvs_frangi3d
 - intensity_gate, threshold_vesselness, iterative_hysteresis
@@ -67,7 +67,7 @@ from scipy import ndimage
 from scipy.ndimage import gaussian_filter, binary_fill_holes 
 from skimage.measure import label
 import SimpleITK as sitk
-from .transforms import register_t1_to_ht2w
+from .transforms import register_t1_to_hT2w
 from typing import Tuple
 
 
@@ -238,7 +238,7 @@ def make_output_paths(
     # Do not default to MNI; require explicit space or override.
     if space_part is None:
         raise ValueError(
-            "make_output_paths: space-<...> not found; pass space_override='TOF'/'MRV'/'HT2w'"
+            "make_output_paths: space-<...> not found; pass space_override='TOF'/'MRV'/'hT2w'"
         )
 
     base_parts = [sub_part if sub_part else "sub-unknown"]
@@ -624,8 +624,8 @@ def compute_r2star_map(
 # -------------------------------------------------------------
 # PVS PREPROCESSING (hT2w-specific; window→band-threshold→morph)
 # -------------------------------------------------------------
-def pvs_preprocess_ht2w(
-    ht2w_nii: Path,
+def pvs_preprocess_hT2w(
+    hT2w_nii: Path,
     *,
     # Finalized choices (defaults reflect what you said you use)
     clip_low: float = 1.0,        # percentile
@@ -645,7 +645,7 @@ def pvs_preprocess_ht2w(
 
     Parameters
     ----------
-    ht2w_nii : Path
+    hT2w_nii : Path
         Path to hT2w NIfTI. Affine and header are propagated unchanged.
     clip_low, clip_high : float, optional
         Percentiles used for robust windowing, then rescaled to [0, 1].
@@ -704,7 +704,7 @@ def pvs_preprocess_ht2w(
     - Keep-band aims to isolate mid-gray intensities typical of PVS on hT2w.
     """
     # ---- load
-    img, aff, hdr = load_nifti(ht2w_nii)  # expects float + header/affine
+    img, aff, hdr = load_nifti(hT2w_nii)  # expects float + header/affine
     data = img.astype(np.float32, copy=False)
 
     # ---- robust windowing to [0,1]
@@ -759,7 +759,7 @@ def pvs_preprocess_ht2w(
 
         # derive BIDS-ish tokens from input name
         stem_parts = []
-        txt = str(ht2w_nii)
+        txt = str(hT2w_nii)
         m_sub = re.search(r"(sub-[A-Za-z0-9][A-Za-z0-9_]+)", txt)
         m_ses = re.search(r"(ses-[A-Za-z0-9]+)", txt)
         if m_sub:
@@ -1395,10 +1395,10 @@ def _robust_scale_to_01(arr: np.ndarray, pct=(1.0, 99.0)) -> np.ndarray:
 # One-call entry: T1 light-preproc → DIPY register → EPC → (optional save)
 # -----------------------------------------------------------------
 
-def epc_from_t1_and_ht2w(
+def epc_from_t1_and_hT2w(
     t1_path: Path,
-    ht2w_arr: np.ndarray,
-    ht2w_aff: np.ndarray,
+    hT2w_arr: np.ndarray,
+    hT2w_aff: np.ndarray,
     *,
     out_fused_path: Path | None = None,
     out_xfm_path: Path | None = None,     # NEW: save affine used for registration
@@ -1416,12 +1416,12 @@ def epc_from_t1_and_ht2w(
     ----------
     t1_path : Path
         Path to a T1 NIfTI (raw or denoised).
-    ht2w_arr : ndarray
+    hT2w_arr : ndarray
         Preprocessed hT2w array in [0, 1].
-    ht2w_aff : ndarray
+    hT2w_aff : ndarray
         4×4 affine for hT2w (used when writing fused output).
     out_fused_path : Path or None, optional
-        If provided, write the EPC image as NIfTI (affine = `ht2w_aff`).
+        If provided, write the EPC image as NIfTI (affine = `hT2w_aff`).
     out_xfm_path : Path or None, optional
         If provided, save the affine matrix used for registration as text.
     do_n4 : bool, optional
@@ -1429,7 +1429,7 @@ def epc_from_t1_and_ht2w(
     robust_pct : tuple of float, optional
         Percentiles for robust scaling of T1 to [0, 1]. Default: (1.0, 99.0).
     reg_mode : str, optional
-        Registration mode key understood by `register_t1_to_ht2w`.
+        Registration mode key understood by `register_t1_to_hT2w`.
     use_nonlin : bool, optional
         If True, enable non-linear refinement (if supported by `register_*`).
     brain_mask : ndarray or None, optional
@@ -1440,7 +1440,7 @@ def epc_from_t1_and_ht2w(
     Returns
     -------
     ndarray
-        EPC image, float32 in [0, 1], same shape as `ht2w_arr`.
+        EPC image, float32 in [0, 1], same shape as `hT2w_arr`.
 
     Files written
     -------------
@@ -1451,24 +1451,24 @@ def epc_from_t1_and_ht2w(
 
     Assumptions / Preconditions
     ---------------------------
-    - `ht2w_arr` is preprocessed and scaled to [0, 1].
-    - `register_t1_to_ht2w` returns `(registered_array, affine_used)`.
+    - `hT2w_arr` is preprocessed and scaled to [0, 1].
+    - `register_t1_to_hT2w` returns `(registered_array, affine_used)`.
 
     Raises
     ------
     RuntimeError
-        If the registered T1 and `ht2w_arr` shapes do not match.
+        If the registered T1 and `hT2w_arr` shapes do not match.
 
     Notes
     -----
     - N4 is performed via `_n4_on_numpy`; robust scaling uses `_robust_scale_to_01`.
-    - The saved transform is whatever `register_t1_to_ht2w` reports as `aff_used`.
+    - The saved transform is whatever `register_t1_to_hT2w` reports as `aff_used`.
     """
     t1_nib = nib.load(str(t1_path))
     t1_arr = t1_nib.get_fdata().astype(np.float32)
     t1_aff = t1_nib.affine
 
-    ht2w_arr = np.clip(ht2w_arr.astype(np.float32, copy=False), 0.0, 1.0)
+    hT2w_arr = np.clip(hT2w_arr.astype(np.float32, copy=False), 0.0, 1.0)
 
     # Light T1 preprocessing
     if do_n4:
@@ -1476,21 +1476,21 @@ def epc_from_t1_and_ht2w(
     t1_arr = _robust_scale_to_01(t1_arr, pct=robust_pct)
 
     # Register T1 → hT2w
-    t1_reg_arr, aff_used = register_t1_to_ht2w(
+    t1_reg_arr, aff_used = register_t1_to_hT2w(
         moving=t1_arr, moving_aff=t1_aff,
-        static=ht2w_arr, static_aff=ht2w_aff,
+        static=hT2w_arr, static_aff=hT2w_aff,
         reg_mode=reg_mode,
         use_nonlin=use_nonlin,
     )
 
-    if t1_reg_arr.shape != ht2w_arr.shape:
+    if t1_reg_arr.shape != hT2w_arr.shape:
         raise RuntimeError(
-            f"Registration mismatch: T1_reg {t1_reg_arr.shape} vs hT2w {ht2w_arr.shape}"
+            f"Registration mismatch: T1_reg {t1_reg_arr.shape} vs hT2w {hT2w_arr.shape}"
         )
 
     # EPC fusion
     epc = epc_fuse_t1_t2(
-        t1_reg_arr, ht2w_arr,
+        t1_reg_arr, hT2w_arr,
         brain_mask=brain_mask,
         invert_ratio=invert_ratio,
     ).astype(np.float32)
@@ -1499,7 +1499,7 @@ def epc_from_t1_and_ht2w(
     if out_fused_path is not None:
         out_fused_path = Path(out_fused_path)
         out_fused_path.parent.mkdir(parents=True, exist_ok=True)
-        nib.save(nib.Nifti1Image(epc, ht2w_aff), str(out_fused_path))
+        nib.save(nib.Nifti1Image(epc, hT2w_aff), str(out_fused_path))
         print(f"[epc] Saved → {out_fused_path}")
 
     if out_xfm_path is not None:
