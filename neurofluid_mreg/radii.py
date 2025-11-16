@@ -582,8 +582,8 @@ def compute_radii_for_subject(
         default_native_space, img_attr = _CLASS_TO_SPACE_AND_IMG[klass]
 
         # Grid on which radii will be computed for this class
-        op_space = (image_space or default_native_space).upper()
-        seg_op_space = (seg_space or op_space).upper()
+        op_space = (image_space or default_native_space)
+        seg_op_space = (seg_space or op_space)
 
         # --- resolve segmentation + skeleton in seg_op_space ---
         seg_path, skel_path = _seg_and_skel_paths(sp, seg_op_space, klass)
@@ -767,7 +767,7 @@ def _seg_and_skel_paths(sp: SubjectPaths, space: str, klass: str) -> tuple[Path,
     sp : SubjectPaths
         Subject-scoped directories and identifiers.
     space : str
-        Space token (e.g., `TOF`, `MRV`, `hT2W`, `MNI`).
+        Space token (e.g., `TOF`, `MRV`, `hT2w`, `MNI`).
     klass : str
         Structure class (`arteries`, `veins`, `pvs`).
 
