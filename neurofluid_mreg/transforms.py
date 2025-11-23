@@ -296,6 +296,7 @@ def register_to_t1(
     sub_id: str,
     modality_tag: str,
     allow_4d_mean: bool = True,
+    overwrite: bool = False, 
 ) -> Path:
     """
     Register a source image to T1 with MI-based affine (translation→rigid→affine).
@@ -357,6 +358,21 @@ def register_to_t1(
         modality_tag = "MREGMEAN" if modality_tag.upper().startswith("MREG") else modality_tag
         print(f"[xfm] {modality_tag}: used 4D temporal mean for registration")
 
+    # Output path now that tag is final
+    out_txt = out_dir / f"{sub_id}_xfm-{modality_tag}toT1.txt"
+
+    # --- skip if present and valid ---
+    if out_txt.exists() and not overwrite:
+        try:
+            A = np.loadtxt(out_txt)
+            if A.shape == (4, 4):
+                print(f"[xfm] [SKIP] Exists: {out_txt.name}")
+                return out_txt
+            else:
+                print(f"[xfm] [WARN] Bad shape in {out_txt.name} → recompute")
+        except Exception as e:
+            print(f"[xfm] [WARN] Could not read {out_txt.name} ({e}) → recompute")
+
     # Initial COM alignment
     com = transform_centers_of_mass(static, fixed_img.affine, moving, moving_img.affine)
 
@@ -399,7 +415,6 @@ def register_to_t1(
     )
 
     # Save 4×4 matrix
-    out_txt = out_dir / f"{sub_id}_xfm-{modality_tag}toT1.txt"
     _save_affine_txt(opt.affine, out_txt)
     return out_txt
 

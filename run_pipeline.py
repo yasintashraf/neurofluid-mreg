@@ -244,23 +244,12 @@ def main():
     print("\n[STEP] Compute subject MNI brain mask (single, reused everywhere)")
     mask_mni = compute_mni_brain_mask_once(sp, xfm, t1_path=Path(t1_for_reg), overwrite=False)
 
-    # ----------------------------------------------------
-    # 4) RADII (MNI grid) – after MNI anatomicals exist
-    # ----------------------------------------------------
-    if getattr(cfg, "radii_enabled", False):
-        print("\n[STEP] Centerline radii (MNI space)")
-        ow = bool(getattr(cfg, "radii_overwrite", False))
-        compute_radii_for_subject(sp, classes=None, search_radius=2, overwrite=ow,image_space="MNI",seg_space="MNI", image_override=None, allow_on_the_fly_skeleton=True)
-
-    else:
-        print("[radii] [SKIP] Disabled via YAML")
-
     # # (Legacy compatibility) — if it expects MREG radii, keep this.
     # print("\n[STEP] Warp radii → MREG (compat for legacy analysis)")
     # warp_radii_to_mreg( sp, xfm, mreg_ref_path= mreg_mean_img, t1_ref_path=Path(t1_for_reg), overwrite=False,)
 
     # ----------------------------
-    # 5) DISTANCE MAPS (MNI grid)
+    # 4) DISTANCE MAPS (MNI grid)
     # ----------------------------
     print("\n[STEP] Distance maps (MNI space)")
     Path(sp.distmaps_dir).mkdir(parents=True, exist_ok=True)
@@ -268,7 +257,7 @@ def main():
         sp, xfm=xfm, classes=("arteries", "veins", "pvs"), overwrite=True)
 
     # -------------------------------------------------------------
-    # 5b) SPECTRAL BAND MAPS (compute in MREG, then export to MNI)
+    # 4b) SPECTRAL BAND MAPS (compute in MREG, then export to MNI)
     # -------------------------------------------------------------
     print("\n[STEP] Spectral band maps (compute in MREG)")
     bands = cfg.bands or BANDS_DEFAULT
@@ -278,7 +267,7 @@ def main():
     export_bandpower_to_mni(sp, xfm, t1_path=Path(t1_for_reg), overwrite=False)
 
     # ---------------------------------------------
-    # 6) CLUSTERS + STATS/QC  (MNI)
+    # 5) CLUSTERS + STATS/QC  (MNI)
     # ---------------------------------------------
     print("\n[STEP] Distance clusters (MNI)")
     cluster_paths = {}
@@ -322,7 +311,7 @@ def main():
     frequency_map(sp, freq_hz=1.0)
 
     # ---------------------------------------------
-    # 7) CONTINUOUS: power ~ distance (MNI)
+    # 6) CONTINUOUS: power ~ distance (MNI)
     # ---------------------------------------------
     print("\n[STEP] Continuous stats + figures (MNI; robust linear on log1p(power))")
     for klass in ("arteries", "veins", "pvs"):
@@ -332,11 +321,21 @@ def main():
             continue
         analyze_continuous(sp, dist_map_path=dist_map, bands=bands, mask_path=mask_mni, overwrite=True,)
 
+    # ----------------------------------------------------
+    # 7) RADII (MNI grid) – after MNI anatomicals exist
+    # ----------------------------------------------------
+    if getattr(cfg, "radii_enabled", False):
+        print("\n[STEP] Centerline radii (MNI space)")
+        ow = bool(getattr(cfg, "radii_overwrite", False))
+        compute_radii_for_subject(sp, classes=None, search_radius=2, overwrite=ow,image_space="MNI",seg_space="MNI", image_override=None, allow_on_the_fly_skeleton=True)
+
+    else:
+        print("[radii] [SKIP] Disabled via YAML")
+
     # ---------------------------------------------
-    # 8) RADIUS vs POWER
+    # 8) RADII ESTIMATION (MNI)and RADIUS vs POWER
     # ---------------------------------------------
     print("\n[STEP] Radius vs Power")
-    # Later: once analyze_radius_vs_power supports MNI, call it with radii_path in MNI.
     for klass in ("arteries", "veins", "pvs"):
         radii_path = Path(sp.radii_dir) / deriv_name(sp.sub, "MNI", klass, "radius", "map")
         analyze_radius_vs_power(sp, klass, bands=bands, radii_path=radii_path, band_paths=None, mask_path=mask_mni, overwrite=False,)

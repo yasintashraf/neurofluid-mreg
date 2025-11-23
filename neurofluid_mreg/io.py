@@ -136,44 +136,52 @@ class SubjectPaths:
     cfg: "PipelineConfig"  # type:ignore  # forward ref for type hints
 
     def __post_init__(self):
-        self.sub = f"sub-{self.cfg.subject}"
-        self.bids_root = str(Path(self.cfg.bids_root).expanduser())
-        self.deriv_root = str((Path(self.cfg.deriv_root) / self.sub).expanduser())
+        sid = str(self.cfg.subject).strip()
+        self.sub = sid if sid.startswith("sub-") else f"sub-{sid}"
 
-        # Base folders
-        self.sub_root = Path(self.bids_root) / self.sub
+        self.bids_root  = Path(self.cfg.bids_root).expanduser().resolve()
+        self.deriv_root = (Path(self.cfg.deriv_root).expanduser().resolve() / self.sub)
+
+        # Base
+        self.sub_root = self.bids_root / self.sub
         self.anat_dir = self.sub_root / "anat"
         self.func_dir = self.sub_root / "func"
 
-        # Resolve anatomy files (explicit)
+        # Explicit inputs (ensure absolute)
         a = self.cfg.anat or {}
-        self.anat_t1w = _resolve_under(self.anat_dir, a.get("t1w"))
-        self.anat_tof = _resolve_under(self.anat_dir, a.get("tof"))
-        self.anat_inv1 = _resolve_under(self.anat_dir, a.get("inv1"))
-        self.anat_inv2 = _resolve_under(self.anat_dir, a.get("inv2"))
-        self.anat_mrv = _resolve_under(self.anat_dir, a.get("mrv"))
+        self.anat_t1w       = _resolve_under(self.anat_dir, a.get("t1w"))
+        self.anat_tof       = _resolve_under(self.anat_dir, a.get("tof"))
+        self.anat_inv1      = _resolve_under(self.anat_dir, a.get("inv1"))
+        self.anat_inv2      = _resolve_under(self.anat_dir, a.get("inv2"))
+        self.anat_mrv       = _resolve_under(self.anat_dir, a.get("mrv"))
         self.anat_heavy_t2w = _resolve_under(self.anat_dir, a.get("hT2w"))
 
-        # Resolve func file (explicit)
         f = self.cfg.func or {}
         self.func_mreg_bold = _resolve_under(self.func_dir, f.get("mreg"))
 
-        # Derivatives layout (root + subfolders)
-        dr = Path(self.deriv_root)
-        self.anat_out = dr / "anat"
-        self.masks_dir = dr / "masks"
-        self.distmaps_dir = dr / "distmaps"
-        self.mreg_dir = dr / "mreg"
-        self.bandmaps_dir = dr / "bandmaps"
-        self.clusters_dir = dr / "clusters"
-        self.spectra_dir = dr / "spectra"
-        self.stats_dir = dr / "stats"
-        self.figures_dir = dr / "figures"
-        self.qc_dir = dr / "qc"
-        self.manifest_dir = dr / "manifest"
-        self.transforms_dir = dr / "anat"  # transforms live with anat derivatives
-        self.radii_dir = dr / "radii"
-        self.radii_dir.mkdir(parents=True, exist_ok=True)
+        # Derivatives (absolute)
+        dr = self.deriv_root
+        self.anat_out      = (dr / "anat").resolve()
+        self.masks_dir     = (dr / "masks").resolve()
+        self.distmaps_dir  = (dr / "distmaps").resolve()
+        self.mreg_dir      = (dr / "mreg").resolve()
+        self.bandmaps_dir  = (dr / "bandmaps").resolve()
+        self.clusters_dir  = (dr / "clusters").resolve()
+        self.spectra_dir   = (dr / "spectra").resolve()
+        self.stats_dir     = (dr / "stats").resolve()
+        self.figures_dir   = (dr / "figures").resolve()
+        self.qc_dir        = (dr / "qc").resolve()
+        self.manifest_dir  = (dr / "manifest").resolve()
+        self.transforms_dir= self.anat_out  # lives with anat
+        self.radii_dir     = (dr / "radii").resolve()
+
+        # Create dirs once
+        for p in [self.anat_out, self.masks_dir, self.distmaps_dir, self.mreg_dir,
+                self.bandmaps_dir, self.clusters_dir, self.spectra_dir, self.stats_dir,
+                self.figures_dir, self.qc_dir, self.manifest_dir, self.transforms_dir,
+                self.radii_dir]:
+            p.mkdir(parents=True, exist_ok=True)
+
 
 
 def validate_required_inputs(sp: SubjectPaths) -> None:

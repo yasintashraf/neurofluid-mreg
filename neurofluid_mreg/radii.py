@@ -86,7 +86,6 @@ _DEFAULT_CLASSES = ("arteries", "veins", "pvs")
 _DEFAULT_SEARCH_RADIUS = 2  # voxels
 _DEFAULT_OVERWRITE = False
 _WRITE_TSV = True  # you asked to include TSV since it's not difficult
-_NATIVE_SPACE = {"arteries": "TOF", "veins": "MRV", "pvs": "hT2W"}
 
 # Map class -> (space token, SubjectPaths attribute for source image)
 _CLASS_TO_SPACE_AND_IMG = {
@@ -522,7 +521,7 @@ def compute_radii_for_subject(
         is `_DEFAULT_OVERWRITE`.
     image_space : str or None, optional
         Target space token for the intensity image (e.g., `"TOF"`, `"MRV"`,
-        `"hT2W"`, `"MNI"`). If None, the class-specific native space is used.
+        `"hT2w"`, `"MNI"`). If None, the class-specific native space is used.
     seg_space : str or None, optional
         Target space token for segmentation/skeleton. If None, defaults to
         `image_space` (or the class-specific native space when `image_space`
@@ -587,6 +586,7 @@ def compute_radii_for_subject(
 
         # --- resolve segmentation + skeleton in seg_op_space ---
         seg_path, skel_path = _seg_and_skel_paths(sp, seg_op_space, klass)
+        print (seg_path)
         if not seg_path.exists():
             print(
                 f"[radii] [SKIP] Missing segmentation for {klass}@{seg_op_space}: "
@@ -745,7 +745,7 @@ def _tsv_name(sub: str, space: str, klass: str) -> str:
         Subject token used in filenames (typically the subject label, with
         or without the `sub-` prefix depending on `SubjectPaths`).
     space : str
-        Space token (e.g., `TOF`, `MRV`, `hT2W`, `MNI`).
+        Space token (e.g., `TOF`, `MRV`, `hT2w`, `MNI`).
     klass : str
         Structure class (`arteries`, `veins`, `pvs`).
 
@@ -776,9 +776,15 @@ def _seg_and_skel_paths(sp: SubjectPaths, space: str, klass: str) -> tuple[Path,
     tuple of pathlib.Path
         `(seg_path, skel_path)` under `sp.masks_dir`.
     """
-    seg_name = deriv_name(sp.sub, space, klass, "main", "mask")
-    skel_name = deriv_name(sp.sub, space, klass, "skeleton", "mask")
-    return (Path(sp.masks_dir) / seg_name, Path(sp.masks_dir) / skel_name)
+
+    sub   = sp.sub.strip()
+    space = "MNI" if space.strip().upper()=="MNI" else space.strip()
+    klass = klass.strip().lower()
+
+    base  = Path(sp.masks_dir).resolve()  # <-- key fix
+    seg   = base / deriv_name(sub, space, klass, "main", "mask")
+    skel  = base / deriv_name(sub, space, klass, "skeleton", "mask")
+    return seg, skel
 
 
 def _radii_out_paths(sp: SubjectPaths, space: str, klass: str) -> tuple[Path, Path]:
@@ -790,7 +796,7 @@ def _radii_out_paths(sp: SubjectPaths, space: str, klass: str) -> tuple[Path, Pa
     sp : SubjectPaths
         Subject-scoped directories and identifiers.
     space : str
-        Space token (e.g., `TOF`, `MRV`, `hT2W`, `MNI`).
+        Space token (e.g., `TOF`, `MRV`, `hT2w`, `MNI`).
     klass : str
         Structure class (`arteries`, `veins`, `pvs`).
 

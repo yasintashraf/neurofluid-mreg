@@ -90,7 +90,7 @@
 bids_root: "C:/Users/yasin/Documents/Thesis/Data/Dataset/BIDS"
 
 # Subject ID WITHOUT the "sub-" prefix
-subject: "xh33_x107"
+subject: "gy35_6442"
 
 # Where to write derivatives (can be relative or absolute)
 deriv_root: "derivatives/neurofluid-mreg"
@@ -99,16 +99,29 @@ deriv_root: "derivatives/neurofluid-mreg"
 # You can use absolute paths here. If relative, they’re resolved under:
 #   anat/* -> <bids_root>/sub-<ID>/anat/
 #   func/* -> <bids_root>/sub-<ID>/func/
+
+#   func/* -> <bids_root>/sub-<ID>/func/
+# anat:
+#   t1w:  "xh33_x107_hm_fg_mp2_0p7_cs4_6000_20250314090142_15.nii.gz"     # REQUIRED
+#   tof:  "xh33_x107_ToF400_wb_cs6_noFC_20250314090142_22.nii.gz"         # REQUIRED
+#   inv1: "xh33_x107_hm_fg_mp2_0p7_cs4_6000_20250314090142_11.nii.gz"     # optional
+#   inv2: "xh33_x107_hm_fg_mp2_0p7_cs4_6000_20250314090142_12.nii.gz"     # optional
+#   mrv:  "xh33_x107_dzne_ep3d_uhr_0p5iso_tra_3TE_20250314090142_25_e3.nii.gz"
+#   hT2w: "xh33_x107_hT2w_spc_fast_TR3000_20250314090142_16.nii.gz"
+
+# func:
+#   mreg: "xh33_x107_hm_ep2d_mreg_3p0_12_200_20250314090142_18_slab2.nii.gz"   # REQUIRED
+
 anat:
-  t1w:  "xh33_x107_hm_fg_mp2_0p7_cs4_6000_20250314090142_15.nii.gz"     # REQUIRED
-  tof:  "xh33_x107_ToF400_wb_cs6_noFC_20250314090142_22.nii.gz"         # REQUIRED
-  inv1: "xh33_x107_hm_fg_mp2_0p7_cs4_6000_20250314090142_11.nii.gz"     # optional
-  inv2: "xh33_x107_hm_fg_mp2_0p7_cs4_6000_20250314090142_12.nii.gz"     # optional
-  mrv:  "xh33_x107_dzne_ep3d_uhr_0p5iso_tra_3TE_20250314090142_25_e3.nii.gz"
-  hT2w: "xh33_x107_hT2w_spc_fast_TR3000_20250314090142_16.nii.gz"
+  t1w:  "gy35_6442_hm_mp2rage_wip925b_0p7_TR6s_cs4_20251117100212_6.nii.gz"     # REQUIRED
+  tof:  "gy35_6442_hm_ToF_040_cs7.2_Seg5_20251117100212_22.nii.gz"         # REQUIRED
+  inv1: "gy35_6442_hm_mp2rage_wip925b_0p7_TR6s_cs4_20251117100212_5.nii.gz"  # TEMP
+  inv2: "gy35_6442_hm_mp2rage_wip925b_0p7_TR6s_cs4_20251117100212_6.nii.gz"    # optional
+  mrv:  "gy35_6442_dzne_ep3d_0p7iso_v0_20251117100212_11.nii.gz"
+  hT2w: "gy35_6442_dzne_T2w_0.8iso_UP_20251117100212_10.nii.gz"
 
 func:
-  mreg: "xh33_x107_hm_ep2d_mreg_3p0_12_200_20250314090142_18.nii.gz"   # REQUIRED
+  mreg: "gy35_6442_ep2d_mreg_20251117100212_17.nii.gz"   # REQUIRED
 
 # ==== ANALYSIS PARAMETERS ====
 bands:
