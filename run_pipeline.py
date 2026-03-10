@@ -14,10 +14,11 @@ Pipeline steps
 1. Segmentation in native spaces (TOF/MRV/hT2w).
 2. MREG preprocessing (realign, detrend) and temporal mean.
 3. Core transforms (affine source→T1; optional SyN T1→MNI).
-4. Warp masks (and radii) to the MREG grid (optional MNI exports).
-5. Distance maps on the MREG grid.
-6. Bandpower maps, clusters, spectra, and statistics/QC (MREG grid).
-7. Continuous analyses (band power vs. distance, and radius vs. power).
+4. Warp anatomical masks to MNI space and export MREG bandpower maps to MNI.
+5. Distance maps and distance clusters in MNI space.
+6. Binned and continuous statistics/QC in MNI space.
+7. Warp cluster labels back to MREG only for cluster-spectrum extraction.
+8. Radius estimation and radius-vs-power analysis in MNI space.
 
 Inputs / Outputs
 ----------------
@@ -30,7 +31,7 @@ Files written
 -------------
 - derivatives/neurofluid-mreg/sub-<ID>/masks/sub-<ID>_space-<SPACE>_class-<CLASS>_desc-<DESC>_<SUFFIX>.nii.gz
 - derivatives/neurofluid-mreg/sub-<ID>/mreg/sub-<ID>_space-MREG_class-brain_desc-<DESC>_<SUFFIX>.nii.gz
-- derivatives/neurofluid-mreg/sub-<ID>/distmaps/sub-<ID>_space-MREG_class-<CLASS>_desc-dist_map.nii.gz
+- derivatives/neurofluid-mreg/sub-<ID>/distmaps/sub-<ID>_space-MNI_class-<CLASS>_desc-dist_map.nii.gz
 - derivatives/neurofluid-mreg/sub-<ID>/bandmaps/... (bandpower maps)
 - derivatives/neurofluid-mreg/sub-<ID>/clusters/... (distance-bin labels)
 - derivatives/neurofluid-mreg/sub-<ID>/spectra/... (NPZ spectra)
@@ -39,8 +40,11 @@ Files written
 
 Assumptions / Preconditions
 ---------------------------
-- Spaces: segmentation runs in native modality spaces; analysis runs on the
-  native MREG grid after warping. Affines define geometry for resampling.
+- Spaces: segmentation runs in native modality spaces; bandpower is computed
+  in native MREG space and exported to MNI; distance maps, clusters, and
+  statistical analyses are performed in MNI space. Cluster labels are warped
+  back to MREG only for spectrum extraction. Affines define geometry for
+  resampling.
 - Shapes/dtypes: image outputs are float32; label/mask outputs are uint8;
   spectra/stats use standard NumPy dtypes.
 - BIDS naming: NIfTI outputs follow
